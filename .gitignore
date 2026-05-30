@@ -8,8 +8,11 @@ dependency-reduced-pom.xml
 __pycache__/
 *.pyc
 
-# ─── Generated sample data (regenerated via data/create_parquet.py) ──────
-data/parquet/
+# ─── Sample data directory (generated locally; not committed) ────────────
+# Ignore everything under data/ EXCEPT the generator script that the README
+# documents for recreating the sample Parquet partitions.
+data/*
+!data/create_parquet.py
 
 # ─── Spark / Hadoop runtime artifacts ───────────────────────────────────
 spark-warehouse/
