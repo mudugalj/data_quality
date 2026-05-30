@@ -10,22 +10,22 @@ class ReportGeneratorSpec extends AnyFunSuite {
   private def mkResult(status: Status, appCode: Option[String] = None) = DqResult(
     java.util.UUID.randomUUID().toString, "c1", appCode, "v1", now, "r1", now,
     "tbl", SourceType.Parquet, "col", None, CheckType.Completeness,
-    EvaluationMode.Violation, status, Measures.Empty, None, IssueStatus.None)
+    EvaluationMode.Violation, status, Measures.Empty, None, None)
 
   test("empty run -> all-zero counts") {
     val r = ReportGenerator.empty(ctx)
     assert(r.executed === 0); assert(r.passed === 0)
   }
 
-  test("executed = passed + failed + errored + inconclusive") {
+  test("executed = passed + failed + errored") {
     val results = Seq(mkResult(Status.Passed), mkResult(Status.Passed),
-                      mkResult(Status.Failed), mkResult(Status.Errored), mkResult(Status.Inconclusive))
+                      mkResult(Status.Failed), mkResult(Status.Errored))
     val r = ReportGenerator.generate(results, ctx)
-    assert(r.passed === 2); assert(r.failed === 1); assert(r.errored === 1); assert(r.inconclusive === 1)
-    assert(r.executed === 5)
+    assert(r.passed === 2); assert(r.failed === 1); assert(r.errored === 1)
+    assert(r.executed === 4)
   }
 
-  test("exceptionReport returns only failed + errored + inconclusive") {
+  test("exceptionReport returns only failed + errored") {
     val results = Seq(mkResult(Status.Passed), mkResult(Status.Failed), mkResult(Status.Errored))
     val exc = ReportGenerator.generate(results, ctx).exceptionReport
     assert(exc.size === 2); assert(!exc.exists(_.status == Status.Passed))

@@ -32,18 +32,21 @@ class ModelsSpec extends AnyFunSuite {
     assert(SourceType.fromWire("csv")           === None)
   }
 
-  test("Status.failLike contains Failed, Errored, Inconclusive but not Passed") {
+  test("Status.failLike contains Failed and Errored but not Passed") {
     assert(Status.failLike.contains(Status.Failed))
     assert(Status.failLike.contains(Status.Errored))
-    assert(Status.failLike.contains(Status.Inconclusive))
     assert(!Status.failLike.contains(Status.Passed))
   }
 
   test("IssueStatus.fromWire round-trips for all values") {
-    Seq(IssueStatus.New, IssueStatus.Recurring, IssueStatus.Resolved,
-        IssueStatus.None, IssueStatus.Unknown).foreach { is =>
+    Seq(IssueStatus.New, IssueStatus.Recurring, IssueStatus.Resolved).foreach { is =>
       assert(IssueStatus.fromWire(is.wire) === Some(is))
     }
+  }
+
+  test("IssueStatus.fromWire returns None for removed statuses") {
+    assert(IssueStatus.fromWire("none")    === None)
+    assert(IssueStatus.fromWire("unknown") === None)
   }
 
   test("isPartitionedFileSource is true only for parquet") {
@@ -62,19 +65,18 @@ class ModelsSpec extends AnyFunSuite {
     assert(defn.appCode === None)
   }
 
-  test("DqReport.exceptionReport returns only failed/errored/inconclusive") {
+  test("DqReport.exceptionReport returns only failed/errored") {
     val now = Instant.now()
     def mkResult(status: Status) = DqResult(
       java.util.UUID.randomUUID().toString, "c1", None, "v1", now, "r1", now,
       "tbl", SourceType.Parquet, "col", None, CheckType.Completeness,
-      EvaluationMode.Violation, status, Measures.Empty, None, IssueStatus.None)
+      EvaluationMode.Violation, status, Measures.Empty, None, None)
     val results = Seq(
-      mkResult(Status.Passed), mkResult(Status.Failed),
-      mkResult(Status.Errored), mkResult(Status.Inconclusive))
-    val report = DqReport("r1", now, "v1", now, results, 4, 1, 1, 1, 1)
+      mkResult(Status.Passed), mkResult(Status.Failed), mkResult(Status.Errored))
+    val report = DqReport("r1", now, "v1", now, results, 3, 1, 1, 1)
     val exc = report.exceptionReport
-    assert(exc.size === 3)
-    assert(exc.map(_.status).toSet === Set(Status.Failed, Status.Errored, Status.Inconclusive))
+    assert(exc.size === 2)
+    assert(exc.map(_.status).toSet === Set(Status.Failed, Status.Errored))
   }
 
   test("ScopeLabel.toPartitionValueString returns Some for PartitionValue and FilterValue, None for NotApplicable") {

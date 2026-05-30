@@ -1,9 +1,11 @@
 -- DQ Engine metadata store schema
 -- Applied automatically on first docker compose up against database: dq_store
 --
--- Evaluation modes: violation | consistency_delta | consistency_mom
--- Check types:      completeness | validity | consistency
--- Source types:     parquet | mariadb_table | hive_table  (app-validated, not DB-constrained)
+-- Evaluation modes:  violation | consistency_delta | consistency_mom
+-- Check types:       completeness | validity | consistency
+-- Source types:      parquet | mariadb_table | hive_table  (app-validated, not DB-constrained)
+-- Statuses:          passed | failed | errored
+-- Issue statuses:    new | recurring | resolved
 -- No expected_value or comparison_operator — thresholds live in check_sql
 
 CREATE TABLE IF NOT EXISTS config_versions (
@@ -65,7 +67,7 @@ CREATE TABLE IF NOT EXISTS result_store (
     check_type          VARCHAR(32)   NOT NULL,
     evaluation_mode     VARCHAR(32)   NOT NULL,
     status              VARCHAR(16)   NOT NULL,
-    issue_status        VARCHAR(16)   NOT NULL,
+    issue_status        VARCHAR(16)   NULL,
     violation_count     BIGINT        NULL,
     current_value       DECIMAL(38,6) NULL,
     prior_value         DECIMAL(38,6) NULL,
@@ -75,9 +77,9 @@ CREATE TABLE IF NOT EXISTS result_store (
     CONSTRAINT fk_result_config_version
         FOREIGN KEY (config_version) REFERENCES config_versions(config_version),
     CONSTRAINT chk_status
-        CHECK (status IN ('passed','failed','errored','inconclusive')),
+        CHECK (status IN ('passed','failed','errored')),
     CONSTRAINT chk_issue_status
-        CHECK (issue_status IN ('new','recurring','resolved','none','unknown')),
+        CHECK (issue_status IS NULL OR issue_status IN ('new','recurring','resolved')),
     CONSTRAINT chk_result_check_type
         CHECK (check_type IN ('completeness','validity','consistency')),
     CONSTRAINT chk_result_eval_mode

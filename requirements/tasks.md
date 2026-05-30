@@ -87,10 +87,10 @@
   3. Execute on SqlTarget _(Req 7.1)_
   4. Judge by evaluation_mode:
      - **violation**: count rows; 0=passed, >0=failed _(Req 4.3, 5.1.2, 5.2.2)_
-     - **consistency_delta**: `|current − prior| ≤ deviation_tolerance`; inconclusive if no prior _(Req 6.1)_
-     - **consistency_mom**: `|current − prior_30d| / |prior_30d| × 100 ≤ deviation_tolerance`; inconclusive if no 28–31d prior or prior=0 _(Req 6.2)_
-  5. Issue classification: lookup prior result keyed on `(table_name, column_name, check_type, app_code)` _(Req 8)_
-- **Tests:** violation 0 rows → passed; violation N rows → failed; consistency_delta within/over tolerance; consistency_delta no prior → inconclusive; consistency_mom within/over tolerance %; consistency_mom no 28–31d prior → inconclusive; prior=0 → inconclusive (MOM); safety validator accepts SELECT, rejects INSERT/DDL/multi-statement; business_rule_filter scoping; app_code carried to DqResult; issue classification all 5 states (new/recurring/resolved/none/unknown)
+     - **consistency_delta**: `|current − prior| ≤ deviation_tolerance`; errored if no prior in 183d window or store failure _(Req 6.1)_
+     - **consistency_mom**: `|current − prior_30d| / |prior_30d| × 100 ≤ deviation_tolerance`; errored if no 28–31d prior, prior=0, or store failure _(Req 6.2)_
+  5. Issue classification: lookup prior result keyed on `(table_name, column_name, check_type, app_code)` → new/recurring/resolved only _(Req 8)_
+- **Tests:** violation 0 rows → passed; violation N rows → failed; consistency_delta within/over tolerance; consistency_delta no prior → errored; consistency_mom within/over tolerance %; consistency_mom no 28–31d prior → errored; prior=0 → errored (MOM); safety validator accepts SELECT, rejects INSERT/DDL/multi-statement; business_rule_filter scoping; app_code carried to DqResult; issue classification all 3 states (new/recurring/resolved)
 
 ---
 

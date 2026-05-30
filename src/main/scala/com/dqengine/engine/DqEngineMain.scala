@@ -82,11 +82,10 @@ object DqEngineMain {
                    |  passed         : ${report.passed}
                    |  failed         : ${report.failed}
                    |  errored        : ${report.errored}
-                   |  inconclusive   : ${report.inconclusive}
                    |  exception count: ${report.exceptionReport.size}""".stripMargin)
         if (writeErrors.nonEmpty)
           System.err.println(s"[DQ Engine] WARNING: ${writeErrors.size} result write error(s)")
-        if (report.failed > 0 || report.errored > 0 || report.inconclusive > 0) {
+        if (report.failed > 0 || report.errored > 0) {
           println("[DQ Engine] Exception report:")
           report.exceptionReport.foreach { r =>
             println(s"  [${r.status.wire.toUpperCase}][${r.appCode.getOrElse("-")}] ${r.tableName}.${r.columnName} (${r.checkId}): ${r.description.getOrElse("")}")

@@ -20,13 +20,13 @@ class SqlCheckExecutor(store: DqStore)(implicit spark: SparkSession) {
       SqlSafetyValidator.validate(defn.checkSql, source.sqlTarget, Some(spark)) match {
         case Left(err) =>
           buildResult(dqRefId, defn, source, ctx, Status.Errored, Measures.Empty,
-            Some(s"check_sql rejected for ${defn.checkId}@${defn.tableName}: $err"), IssueStatus.Unknown)
+            Some(s"check_sql rejected for ${defn.checkId}@${defn.tableName}: $err"), classify(defn, ctx, Status.Errored))
         case Right(safeSql) =>
           val (effectiveSql, filterErr) = applyFilter(safeSql, defn.businessRuleFilter, source)
           filterErr match {
             case Some(err) =>
               buildResult(dqRefId, defn, source, ctx, Status.Errored, Measures.Empty,
-                Some(s"business_rule_filter error for ${defn.checkId}@${defn.tableName}: $err"), IssueStatus.Unknown)
+                Some(s"business_rule_filter error for ${defn.checkId}@${defn.tableName}: $err"), classify(defn, ctx, Status.Errored))
             case None =>
               judgeResult(dqRefId, defn, source, ctx, effectiveSql)
           }
@@ -34,7 +34,7 @@ class SqlCheckExecutor(store: DqStore)(implicit spark: SparkSession) {
     } catch {
       case e: Exception =>
         buildResult(dqRefId, defn, source, ctx, Status.Errored, Measures.Empty,
-          Some(s"Unexpected error for ${defn.checkId}@${defn.tableName}: ${e.getMessage}"), IssueStatus.Unknown)
+          Some(s"Unexpected error for ${defn.checkId}@${defn.tableName}: ${e.getMessage}"), classify(defn, ctx, Status.Errored))
     }
   }
 
@@ -79,13 +79,13 @@ class SqlCheckExecutor(store: DqStore)(implicit spark: SparkSession) {
     Try(runSql(sql, source)) match {
       case Failure(e) =>
         buildResult(dqRefId, defn, source, ctx, Status.Errored, Measures.Empty,
-          Some(s"check_sql failed for ${defn.checkId}: ${e.getMessage}"), IssueStatus.Unknown)
+          Some(s"check_sql failed for ${defn.checkId}: ${e.getMessage}"), classify(defn, ctx, Status.Errored))
       case Success(df) =>
         val count  = Try(df.count()).getOrElse(0L)
         val status = if (count == 0) Status.Passed else Status.Failed
         buildResult(dqRefId, defn, source, ctx, status, Measures.ViolationCount(count),
           if (count > 0) Some(s"$count violation(s) found") else None,
-          classifyIssue(defn, ctx, status))
+          classify(defn, ctx, status))
     }
   }
 
@@ -94,21 +94,21 @@ class SqlCheckExecutor(store: DqStore)(implicit spark: SparkSession) {
   private def executeConsistencyDelta(dqRefId: String, defn: CheckDefinition, source: ResolvedSource, ctx: RunContext, sql: String): DqResult = {
     getSingleNumeric(sql, source, defn) match {
       case Left(err) =>
-        buildResult(dqRefId, defn, source, ctx, Status.Errored, Measures.Empty, Some(err), IssueStatus.Unknown)
+        buildResult(dqRefId, defn, source, ctx, Status.Errored, Measures.Empty, Some(err), classify(defn, ctx, Status.Errored))
       case Right(current) =>
         val windowStart = ctx.runTimestamp.minus(RetentionWindow)
         Try(store.findPreviousResult(defn.tableName, defn.columnName, defn.checkType.wire,
                                      defn.appCode, ctx.runTimestamp, windowStart)) match {
           case Failure(e) =>
-            buildResult(dqRefId, defn, source, ctx, Status.Inconclusive,
+            buildResult(dqRefId, defn, source, ctx, Status.Errored,
               Measures.ConsistencyMeasure(current, None, None),
               Some(s"Cannot retrieve prior result: ${e.getMessage}"),
-              classifyIssue(defn, ctx, Status.Inconclusive))
+              classify(defn, ctx, Status.Errored))
           case Success(None) =>
-            buildResult(dqRefId, defn, source, ctx, Status.Inconclusive,
+            buildResult(dqRefId, defn, source, ctx, Status.Passed,
               Measures.ConsistencyMeasure(current, None, None),
-              Some("No prior result within Retention_Window"),
-              IssueStatus.New)
+              Some("no prior baseline within retention window"),
+              classify(defn, ctx, Status.Passed))
           case Success(Some(prev)) =>
             prev.measures match {
               case Measures.ConsistencyMeasure(pv, _, _) =>
@@ -118,12 +118,12 @@ class SqlCheckExecutor(store: DqStore)(implicit spark: SparkSession) {
                 buildResult(dqRefId, defn, source, ctx, status,
                   Measures.ConsistencyMeasure(current, Some(pv), Some(deviation)),
                   if (!passed) Some(s"deviation $deviation exceeds tolerance ${defn.deviationTolerance}") else None,
-                  classifyIssue(defn, ctx, status))
+                  classify(defn, ctx, status))
               case _ =>
-                buildResult(dqRefId, defn, source, ctx, Status.Inconclusive,
+                buildResult(dqRefId, defn, source, ctx, Status.Passed,
                   Measures.ConsistencyMeasure(current, None, None),
-                  Some("Prior result has no consistency measure"),
-                  classifyIssue(defn, ctx, Status.Inconclusive))
+                  Some("cannot compare; no prior measure"),
+                  classify(defn, ctx, Status.Passed))
             }
         }
     }
@@ -134,30 +134,30 @@ class SqlCheckExecutor(store: DqStore)(implicit spark: SparkSession) {
   private def executeConsistencyMom(dqRefId: String, defn: CheckDefinition, source: ResolvedSource, ctx: RunContext, sql: String): DqResult = {
     getSingleNumeric(sql, source, defn) match {
       case Left(err) =>
-        buildResult(dqRefId, defn, source, ctx, Status.Errored, Measures.Empty, Some(err), IssueStatus.Unknown)
+        buildResult(dqRefId, defn, source, ctx, Status.Errored, Measures.Empty, Some(err), classify(defn, ctx, Status.Errored))
       case Right(current) =>
         val momHigh = ctx.runTimestamp.minus(MomWindowHigh)  // 28 days ago
         val momLow  = ctx.runTimestamp.minus(MomWindowLow)   // 31 days ago
         Try(store.findMomResult(defn.tableName, defn.columnName, defn.checkType.wire,
                                  defn.appCode, momLow, momHigh)) match {
           case Failure(e) =>
-            buildResult(dqRefId, defn, source, ctx, Status.Inconclusive,
+            buildResult(dqRefId, defn, source, ctx, Status.Errored,
               Measures.ConsistencyMeasure(current, None, None),
               Some(s"Cannot retrieve MOM prior result: ${e.getMessage}"),
-              classifyIssue(defn, ctx, Status.Inconclusive))
+              classify(defn, ctx, Status.Errored))
           case Success(None) =>
-            buildResult(dqRefId, defn, source, ctx, Status.Inconclusive,
+            buildResult(dqRefId, defn, source, ctx, Status.Passed,
               Measures.ConsistencyMeasure(current, None, None),
-              Some("No result in the 28-31-day MOM window"),
-              IssueStatus.New)
+              Some("no prior baseline within retention window"),
+              classify(defn, ctx, Status.Passed))
           case Success(Some(prev)) =>
             prev.measures match {
               case Measures.ConsistencyMeasure(pv, _, _) =>
                 if (pv == 0) {
-                  buildResult(dqRefId, defn, source, ctx, Status.Inconclusive,
+                  buildResult(dqRefId, defn, source, ctx, Status.Passed,
                     Measures.ConsistencyMeasure(current, Some(pv), None),
-                    Some("Prior MOM value is zero — percentage deviation undefined"),
-                    classifyIssue(defn, ctx, Status.Inconclusive))
+                    Some("prior MoM value is zero; cannot compute % — passed by default"),
+                    classify(defn, ctx, Status.Passed))
                 } else {
                   val pctDev = ((current - pv).abs / pv.abs) * 100
                   val passed = pctDev <= defn.deviationTolerance
@@ -165,13 +165,13 @@ class SqlCheckExecutor(store: DqStore)(implicit spark: SparkSession) {
                   buildResult(dqRefId, defn, source, ctx, status,
                     Measures.ConsistencyMeasure(current, Some(pv), Some(pctDev)),
                     if (!passed) Some(s"MOM deviation ${pctDev.setScale(2, BigDecimal.RoundingMode.HALF_UP)}% exceeds tolerance ${defn.deviationTolerance}%") else None,
-                    classifyIssue(defn, ctx, status))
+                    classify(defn, ctx, status))
                 }
               case _ =>
-                buildResult(dqRefId, defn, source, ctx, Status.Inconclusive,
+                buildResult(dqRefId, defn, source, ctx, Status.Passed,
                   Measures.ConsistencyMeasure(current, None, None),
-                  Some("Prior MOM result has no consistency measure"),
-                  classifyIssue(defn, ctx, Status.Inconclusive))
+                  Some("cannot compare; no prior measure"),
+                  classify(defn, ctx, Status.Passed))
             }
         }
     }
@@ -179,20 +179,9 @@ class SqlCheckExecutor(store: DqStore)(implicit spark: SparkSession) {
 
   // ── Issue classification ──────────────────────────────────────────────────
 
-  private def classifyIssue(defn: CheckDefinition, ctx: RunContext, currentStatus: Status): IssueStatus = {
-    val windowStart = ctx.runTimestamp.minus(RetentionWindow)
-    Try(store.findPreviousResult(defn.tableName, defn.columnName, defn.checkType.wire,
-                                 defn.appCode, ctx.runTimestamp, windowStart)) match {
-      case Failure(_) => IssueStatus.Unknown
-      case Success(priorOpt) =>
-        (Status.failLike.contains(currentStatus), priorOpt.exists(r => Status.failLike.contains(r.status))) match {
-          case (true, true)   => IssueStatus.Recurring
-          case (true, false)  => IssueStatus.New
-          case (false, true)  => IssueStatus.Resolved
-          case (false, false) => IssueStatus.None
-        }
-    }
-  }
+  private def classify(defn: CheckDefinition, ctx: RunContext, currentStatus: Status): Option[IssueStatus] =
+    IssueClassifier.classify(store, defn.tableName, defn.columnName, defn.checkType.wire,
+                             defn.appCode, ctx.runTimestamp, currentStatus)
 
   // ── SQL execution ─────────────────────────────────────────────────────────
 
@@ -234,7 +223,7 @@ class SqlCheckExecutor(store: DqStore)(implicit spark: SparkSession) {
   private def buildResult(
     dqRefId: String, defn: CheckDefinition, source: ResolvedSource,
     ctx: RunContext, status: Status, measures: Measures,
-    description: Option[String], issueStatus: IssueStatus
+    description: Option[String], issueStatus: Option[IssueStatus]
   ): DqResult = DqResult(
     dqRefId           = dqRefId,
     checkId           = defn.checkId,

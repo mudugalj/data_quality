@@ -2,7 +2,7 @@ package com.dqengine.engine
 
 import com.dqengine.config.ConfigLoader
 import com.dqengine.domain._
-import com.dqengine.exec.SqlCheckExecutor
+import com.dqengine.exec.{SqlCheckExecutor, IssueClassifier}
 import com.dqengine.source.SourceResolver
 import com.dqengine.store.DqStore
 import org.apache.spark.sql.SparkSession
@@ -80,7 +80,8 @@ class DqEngine(
     sourceType = SourceType.Parquet, columnName = defn.columnName, partitionValue = None,
     checkType = defn.checkType, evaluationMode = defn.evaluationMode,
     status = Status.Errored, measures = Measures.Empty, description = Some(msg),
-    issueStatus = IssueStatus.Unknown)
+    issueStatus = IssueClassifier.classify(store, defn.tableName, defn.columnName,
+      defn.checkType.wire, defn.appCode, ctx.runTimestamp, Status.Errored))
 
   private def warn(msg: String): Unit = println(s"[WARN] $msg")
 }

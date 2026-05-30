@@ -34,13 +34,13 @@ object SourceType {
 
 sealed trait Status { def wire: String }
 object Status {
-  case object Passed       extends Status { val wire = "passed"       }
-  case object Failed       extends Status { val wire = "failed"       }
-  case object Errored      extends Status { val wire = "errored"      }
-  case object Inconclusive extends Status { val wire = "inconclusive" }
+  case object Passed  extends Status { val wire = "passed"  }
+  case object Failed  extends Status { val wire = "failed"  }
+  case object Errored extends Status { val wire = "errored" }
   def fromWire(s: String): Option[Status] =
-    Seq(Passed, Failed, Errored, Inconclusive).find(_.wire == s)
-  val failLike: Set[Status] = Set(Failed, Errored, Inconclusive)
+    Seq(Passed, Failed, Errored).find(_.wire == s)
+  /** Statuses that indicate a quality issue requiring classification. */
+  val failLike: Set[Status] = Set(Failed, Errored)
 }
 
 sealed trait IssueStatus { def wire: String }
@@ -48,10 +48,8 @@ object IssueStatus {
   case object New       extends IssueStatus { val wire = "new"       }
   case object Recurring extends IssueStatus { val wire = "recurring" }
   case object Resolved  extends IssueStatus { val wire = "resolved"  }
-  case object None      extends IssueStatus { val wire = "none"      }
-  case object Unknown   extends IssueStatus { val wire = "unknown"   }
   def fromWire(s: String): Option[IssueStatus] =
-    Seq(New, Recurring, Resolved, None, Unknown).find(_.wire == s)
+    Seq(New, Recurring, Resolved).find(_.wire == s)
 }
 
 // ─── Config types ────────────────────────────────────────────────────────────
@@ -175,7 +173,7 @@ case class DqResult(
   status: Status,
   measures: Measures,
   description: Option[String],
-  issueStatus: IssueStatus
+  issueStatus: Option[IssueStatus]
 )
 
 case class DqReport(
@@ -187,9 +185,9 @@ case class DqReport(
   executed: Int,
   passed: Int,
   failed: Int,
-  errored: Int,
-  inconclusive: Int
+  errored: Int
 ) {
+  /** Results with a fail-like status (failed | errored). */
   def exceptionReport: Seq[DqResult] =
     results.filter(r => Status.failLike.contains(r.status))
 }

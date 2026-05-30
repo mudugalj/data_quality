@@ -156,7 +156,7 @@ class DqStore(config: MariaDbConfig) {
       ps.setString(12, result.checkType.wire)
       ps.setString(13, result.evaluationMode.wire)
       ps.setString(14, result.status.wire)
-      ps.setString(15, result.issueStatus.wire)
+      setOpt(ps, 15, result.issueStatus.map(_.wire))
       result.measures match {
         case Measures.ViolationCount(n) =>
           ps.setLong(16, n)
@@ -303,7 +303,7 @@ class DqStore(config: MariaDbConfig) {
       status            = Status.fromWire(rs.getString("status")).getOrElse(Status.Errored),
       measures          = measures,
       description       = Option(rs.getString("description")),
-      issueStatus       = IssueStatus.fromWire(rs.getString("issue_status")).getOrElse(IssueStatus.Unknown)
+      issueStatus       = Option(rs.getString("issue_status")).flatMap(IssueStatus.fromWire)
     )
   }
 }
