@@ -1,0 +1,36 @@
+# ─── Maven / build output ───────────────────────────────────────────────
+target/
+dependency-reduced-pom.xml
+*.class
+
+# ─── Python venv for local Spark 3.3.2 testing (not committed) ───────────
+.spark332-env/
+__pycache__/
+*.pyc
+
+# ─── Generated sample data (regenerated via data/create_parquet.py) ──────
+data/parquet/
+
+# ─── Spark / Hadoop runtime artifacts ───────────────────────────────────
+spark-warehouse/
+metastore_db/
+derby.log
+*.log
+
+# ─── Binary spec / planning docs (kept out of the repo) ─────────────────
+DQ_Engine_Requirements_Design.pptx
+DQ_Engine_Jira_Tasks.xlsx
+
+# ─── Tooling / local agent state ────────────────────────────────────────
+.claude/
+
+# ─── OS / editor noise ──────────────────────────────────────────────────
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+*.iml
+
+# ─── ScalaTest output ───────────────────────────────────────────────────
+*.scalatest-reports/
