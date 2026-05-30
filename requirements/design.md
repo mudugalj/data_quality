@@ -26,7 +26,8 @@ CLI (spark-submit)
        │    ├─ MariaDbTableReader    — JDBC to MySQL/MariaDB data source
        │    └─ HiveTableReader       — JDBC to HiveServer2
        ├─ SqlCheckExecutor  — single execution path for all checks + classification
-       │    └─ SqlSafetyValidator    — read-only gate
+       │    ├─ SqlSafetyValidator    — read-only gate
+       │    └─ IssueClassifier       — shared new/recurring/resolved (or None) classifier
        └─ DqStore           — all MariaDB_Store I/O (config, catalog, results)
 ```
 
@@ -115,13 +116,41 @@ Single execution path for all checks. Five steps:
 
 **Step 4 — Judge by evaluation_mode**:
 
-| Mode | Logic | Req |
-|------|-------|-----|
-| `violation` | Count rows returned; 0=passed, >0=failed | 4.3, 5.1.2, 5.2.2 |
-| `consistency_delta` | Single numeric value vs most recent prior within Retention_Window; `\|current−prior\| ≤ deviation_tolerance` | 6.1.3–6.1.9 |
-| `consistency_mom` | Single numeric value vs value in [−31d, −28d] window; `\|current−prior\|/\|prior\|×100 ≤ deviation_tolerance` | 6.2.3–6.2.9 |
+| Mode | Outcome | Status | Req |
+|------|---------|--------|-----|
+| `violation` | 0 rows | passed | 4.3, 5.1.2, 5.2.2 |
+| `violation` | ≥1 rows | failed | 4.3, 5.1.2, 5.2.2 |
+| `violation` | SQL/safety/filter error | errored | 7.4 |
+| `consistency_delta` | `\|current−prior\| ≤ tolerance` | passed | 6.1.5 |
+| `consistency_delta` | `> tolerance` | failed | 6.1.6 |
+| `consistency_delta` | no prior baseline in window | failed ("no prior baseline within retention window") | 6.1.7 |
+| `consistency_delta` | prior exists, no usable measure | failed ("cannot compare; no prior measure") | 6.1.8 |
+| `consistency_delta` | check_sql no value / non-numeric | errored | 6.1.10 |
+| `consistency_delta` | prior-result lookup fails | errored | 6.1.9, 12.4 |
+| `consistency_mom` | `\|current−prior\|/\|prior\|×100 ≤ tolerance` | passed | 6.2.5 |
+| `consistency_mom` | `> tolerance` | failed | 6.2.6 |
+| `consistency_mom` | no result in 28–31d window | failed ("no prior MoM baseline (28–31 day window)") | 6.2.7 |
+| `consistency_mom` | prior value == 0 | failed ("prior MoM value is zero; cannot compute %") | 6.2.8 |
+| `consistency_mom` | check_sql no value / non-numeric | errored | 6.2.10 |
+| `consistency_mom` | prior-result lookup fails | errored | 6.2.9, 12.4 |
 
-**Step 5 — Issue classification** _(Req 8)_: keyed on `(table_name, column_name, check_type, app_code)`.
+The open / did-not-pass set is `{failed, errored}`. A consistency check's first run has no baseline and is therefore failed (not errored), classified `new`; once a stable baseline exists it flips to passed + resolved, then carries no issue_status. Failure can happen across any check type.
+
+**Step 5 — Issue classification** _(Req 8)_: performed by a shared `IssueClassifier` component (used by both the SqlCheckExecutor and the engine), keyed on `(table_name, column_name, check_type, app_code)`, using the most recent prior result in the Retention_Window. open = status ∈ `{failed, errored}`.
+
+| Current | Prior | issue_status |
+|---------|-------|--------------|
+| open | open | `recurring` |
+| open | no prior OR passed | `new` |
+| passed | open | `resolved` |
+| passed | no prior OR passed | None (no case) |
+| any | prior-lookup fails | None (cannot classify) |
+
+These non-passing, classified results feed a downstream case-management workflow.
+
+### IssueClassifier _(Req 8)_
+
+Shared component used by both the SqlCheckExecutor and the engine. Given the current status and the most recent prior result within the Retention_Window (keyed on `(table_name, column_name, check_type, app_code)`), it returns `Option[IssueStatus]`: `recurring` (current open + prior open), `new` (current open + no/clean prior), `resolved` (current passed + prior open), or `None` (current passed + no/clean prior, or the prior-lookup failed). open = status ∈ `{failed, errored}`.
 
 ### DqEngine _(Req 11, 12)_
 
@@ -145,17 +174,17 @@ Run lifecycle:
 | `CheckType` | `completeness`, `validity`, `consistency` |
 | `EvaluationMode` | `violation`, `consistency_delta`, `consistency_mom` |
 | `SourceType` | `parquet`, `mariadb_table`, `hive_table` |
-| `Status` | `passed`, `failed`, `errored`, `inconclusive` |
-| `IssueStatus` | `new`, `recurring`, `resolved`, `none`, `unknown` |
+| `Status` | `passed`, `failed`, `errored` |
+| `IssueStatus` | `new`, `recurring`, `resolved` |
 
 ### CheckDefinition
 Fields: `checkId`, `tableName`, `columnName` (required), `dataType` (opt), `checkType` (required), `businessGlossary` (opt), `businessRuleFilter` (opt), `deviationTolerance` (default 0), `checkSql` (required), `evaluationMode` (required), `appCode` (opt). Associated with `configVersion` + `configVersionDate`.
 
 ### DqResult
-Fields: `dqRefId` (UUID), `checkId`, `appCode`, `configVersion`, `configVersionDate`, `runId`, `runTimestamp`, `tableName`, `sourceType`, `columnName`, `partitionValue`, `checkType`, `evaluationMode`, `status`, `measures` (ViolationCount | ConsistencyMeasure | Empty), `description`, `issueStatus`.
+Fields: `dqRefId` (UUID), `checkId`, `appCode`, `configVersion`, `configVersionDate`, `runId`, `runTimestamp`, `tableName`, `sourceType`, `columnName`, `partitionValue`, `checkType`, `evaluationMode`, `status`, `measures` (ViolationCount | ConsistencyMeasure | Empty), `description`, `issueStatus: Option[IssueStatus]` (None when no case is tracked).
 
 ### DqReport
-Fields: `runId`, `runTimestamp`, `configVersion`, `configVersionDate`, `results`, `executed`, `passed`, `failed`, `errored`, `inconclusive`. Helper: `exceptionReport` → failed + errored + inconclusive.
+Fields: `runId`, `runTimestamp`, `configVersion`, `configVersionDate`, `results`, `executed`, `passed`, `failed`, `errored`. `executed = passed + failed + errored`. Helper: `exceptionReport` → failed + errored.
 
 ## Database Schema
 
@@ -215,15 +244,15 @@ CREATE TABLE result_store (
     check_type          VARCHAR(32)   NOT NULL,
     evaluation_mode     VARCHAR(32)   NOT NULL,
     status              VARCHAR(16)   NOT NULL,
-    issue_status        VARCHAR(16)   NOT NULL,
+    issue_status        VARCHAR(16)   NULL,
     violation_count     BIGINT        NULL,             -- violation mode
     current_value       DECIMAL(38,6) NULL,             -- consistency modes
     prior_value         DECIMAL(38,6) NULL,             -- consistency modes
     deviation           DECIMAL(38,6) NULL,             -- consistency modes (abs or pct)
     description         TEXT          NULL,
     FOREIGN KEY (config_version) REFERENCES config_versions(config_version),
-    CHECK (status IN ('passed','failed','errored','inconclusive')),
-    CHECK (issue_status IN ('new','recurring','resolved','none','unknown')),
+    CHECK (status IN ('passed','failed','errored')),
+    CHECK (issue_status IS NULL OR issue_status IN ('new','recurring','resolved')),
     CHECK (check_type IN ('completeness','validity','consistency')),
     CHECK (evaluation_mode IN ('violation','consistency_delta','consistency_mom'))
 );
@@ -255,7 +284,8 @@ hive-server:       apache/hive:4.0.1  →  JDBC: jdbc:hive2://localhost:10000/de
 | check_sql safety validation fails | That check errored; continue | 7.2–7.4 |
 | check_sql execution fails | That check errored; continue | 7.4 |
 | Result_Store write failure | Log; continue writing remaining | 9.4, 12.3 |
-| Prior result lookup fails (consistency) | That check inconclusive; continue | 12.4 |
+| Prior result lookup fails (consistency) | That check errored; continue | 12.4 |
+| Consistency check has no prior baseline in window | That check failed (not errored); classified `new`; continue | 6.1.7, 6.2.7 |
 
 ## Technology Stack
 
@@ -280,7 +310,7 @@ hive-server:       apache/hive:4.0.1  →  JDBC: jdbc:hive2://localhost:10000/de
 | Req 5 — Validity | SqlCheckExecutor (violation) | Task 6 |
 | Req 6 — Consistency | SqlCheckExecutor (delta + mom) · DqStore (findPreviousResult · findMomResult) | Task 6 · Task 3 |
 | Req 7 — Execution Engine | SqlSafetyValidator · SqlCheckExecutor | Task 6 |
-| Req 8 — Classification | SqlCheckExecutor (classifyIssue) · DqStore | Task 6 · Task 3 |
+| Req 8 — Classification | IssueClassifier (shared) · SqlCheckExecutor · DqStore | Task 6 · Task 3 |
 | Req 9 — Persistence | DqStore · ResultWriter | Task 3 · Task 7 |
 | Req 10 — Reporting | ReportGenerator · DqReport | Task 7 |
 | Req 11 — Run Control | DqEngine · DqEngineMain | Task 8 |

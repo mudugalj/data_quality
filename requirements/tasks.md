@@ -29,9 +29,9 @@
 **Design refs:** Data Model section  
 **Requirements:** Req 2.2–2.3 (CheckDefinition fields), Req 3 (app_code), Req 9.3 (DqResult fields), Req 10 (DqReport)
 
-- Sealed enums: `CheckType` (completeness|validity|consistency), `EvaluationMode` (violation|consistency_delta|consistency_mom), `SourceType` (parquet|mariadb_table|hive_table), `Status`, `IssueStatus` — each with `wire` + case-sensitive `fromWire`
-- Case classes: `ConfigVersionInfo`, `CheckDefinition` (with `appCode: Option[String]`), `SourceCatalogEntry` (with `isPartitionedFileSource`), `PartitionParameter`, `RunContext`, `ReadScope`, `ScopeLabel`, `SqlTarget` (SparkTempView | JdbcConnection), `ResolvedSource`, `Measures` (ViolationCount | ConsistencyMeasure | Empty), `DqResult` (with `appCode`, `evaluationMode`), `DqReport`, engine result types, error types, `MariaDbConfig`, `HiveConfig`, `EngineConfig`
-- **Tests:** fromWire round-trips; consistency_delta/consistency_mom are valid EvaluationMode values; exceptionReport correct subset; isPartitionedFileSource true only for parquet
+- Sealed enums: `CheckType` (completeness|validity|consistency), `EvaluationMode` (violation|consistency_delta|consistency_mom), `SourceType` (parquet|mariadb_table|hive_table), `Status` (passed|failed|errored — exactly 3 values), `IssueStatus` (new|recurring|resolved — exactly 3 values) — each with `wire` + case-sensitive `fromWire`
+- Case classes: `ConfigVersionInfo`, `CheckDefinition` (with `appCode: Option[String]`), `SourceCatalogEntry` (with `isPartitionedFileSource`), `PartitionParameter`, `RunContext`, `ReadScope`, `ScopeLabel`, `SqlTarget` (SparkTempView | JdbcConnection), `ResolvedSource`, `Measures` (ViolationCount | ConsistencyMeasure | Empty), `DqResult` (with `appCode`, `evaluationMode`, `issueStatus: Option[IssueStatus]`), `DqReport` (counts executed/passed/failed/errored only — no inconclusive), engine result types, error types, `MariaDbConfig`, `HiveConfig`, `EngineConfig`
+- **Tests:** fromWire round-trips; consistency_delta/consistency_mom are valid EvaluationMode values; Status/IssueStatus each have exactly 3 values; issueStatus is optional (None when no case); exceptionReport = failed + errored; isPartitionedFileSource true only for parquet
 
 ---
 
@@ -85,12 +85,12 @@
   1. Safety gate → errored on rejection _(Req 7.2)_
   2. business_rule_filter scoping (overwrite temp view for Parquet; compose WHERE clause for JDBC) _(Req 4.4, 5.1.4, 6.3.1)_
   3. Execute on SqlTarget _(Req 7.1)_
-  4. Judge by evaluation_mode:
-     - **violation**: count rows; 0=passed, >0=failed _(Req 4.3, 5.1.2, 5.2.2)_
-     - **consistency_delta**: `|current − prior| ≤ deviation_tolerance`; errored if no prior in 183d window or store failure _(Req 6.1)_
-     - **consistency_mom**: `|current − prior_30d| / |prior_30d| × 100 ≤ deviation_tolerance`; errored if no 28–31d prior, prior=0, or store failure _(Req 6.2)_
-  5. Issue classification: lookup prior result keyed on `(table_name, column_name, check_type, app_code)` → new/recurring/resolved only _(Req 8)_
-- **Tests:** violation 0 rows → passed; violation N rows → failed; consistency_delta within/over tolerance; consistency_delta no prior → errored; consistency_mom within/over tolerance %; consistency_mom no 28–31d prior → errored; prior=0 → errored (MOM); safety validator accepts SELECT, rejects INSERT/DDL/multi-statement; business_rule_filter scoping; app_code carried to DqResult; issue classification all 3 states (new/recurring/resolved)
+  4. Judge by evaluation_mode (open / did-not-pass set = {failed, errored}):
+     - **violation**: count rows; 0=passed, >0=failed; SQL/safety/filter error=errored _(Req 4.3, 5.1.2, 5.2.2)_
+     - **consistency_delta**: `|current − prior| ≤ deviation_tolerance` → passed, over → failed; **no prior baseline in window → failed**; prior with no usable measure → failed; check_sql no value/non-numeric → errored; **prior-result lookup fails → errored** _(Req 6.1)_
+     - **consistency_mom**: `|current − prior_30d| / |prior_30d| × 100 ≤ deviation_tolerance` → passed, over → failed; **no 28–31d prior → failed**; prior=0 → failed; check_sql no value/non-numeric → errored; **lookup fails → errored** _(Req 6.2)_
+  5. Issue classification via shared `IssueClassifier`: lookup prior result keyed on `(table_name, column_name, check_type, app_code)` → `new`/`recurring`/`resolved` or `None` (None when current passed + no/clean prior, or prior-lookup fails); open = {failed, errored} _(Req 8)_
+- **Tests:** violation 0 rows → passed; violation N rows → failed; consistency_delta within/over tolerance; consistency_delta no prior baseline → failed; consistency_mom within/over tolerance %; consistency_mom no 28–31d prior → failed; prior=0 → failed (MOM); prior-lookup failure → errored; safety validator accepts SELECT, rejects INSERT/DDL/multi-statement; business_rule_filter scoping; app_code carried to DqResult; IssueClassifier yields new/recurring/resolved and None (no case)
 
 ---
 
@@ -100,8 +100,8 @@
 **Requirements:** Req 9, 10
 
 - `ResultWriter`: write each DqResult via DqStore; per-result isolation; all fields including app_code and evaluation_mode _(Req 9.1–9.4)_
-- `ReportGenerator`: aggregate DqReport; executed = passed + failed + errored + inconclusive; skipped checks excluded; config_version + run metadata stamped through _(Req 10)_
-- **Tests:** one write failure doesn't stop others; count invariants; exceptionReport is failed+errored+inconclusive; app_code carried through; evaluation_mode in each result
+- `ReportGenerator`: aggregate DqReport; counts executed/passed/failed/errored only; executed = passed + failed + errored; skipped checks excluded; config_version + run metadata stamped through _(Req 10)_
+- **Tests:** one write failure doesn't stop others; count invariants; exceptionReport is failed+errored; app_code carried through; evaluation_mode in each result
 
 ---
 

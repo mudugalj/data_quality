@@ -105,10 +105,10 @@ class SqlCheckExecutor(store: DqStore)(implicit spark: SparkSession) {
               Some(s"Cannot retrieve prior result: ${e.getMessage}"),
               classify(defn, ctx, Status.Errored))
           case Success(None) =>
-            buildResult(dqRefId, defn, source, ctx, Status.Passed,
+            buildResult(dqRefId, defn, source, ctx, Status.Failed,
               Measures.ConsistencyMeasure(current, None, None),
               Some("no prior baseline within retention window"),
-              classify(defn, ctx, Status.Passed))
+              classify(defn, ctx, Status.Failed))
           case Success(Some(prev)) =>
             prev.measures match {
               case Measures.ConsistencyMeasure(pv, _, _) =>
@@ -120,10 +120,10 @@ class SqlCheckExecutor(store: DqStore)(implicit spark: SparkSession) {
                   if (!passed) Some(s"deviation $deviation exceeds tolerance ${defn.deviationTolerance}") else None,
                   classify(defn, ctx, status))
               case _ =>
-                buildResult(dqRefId, defn, source, ctx, Status.Passed,
+                buildResult(dqRefId, defn, source, ctx, Status.Failed,
                   Measures.ConsistencyMeasure(current, None, None),
                   Some("cannot compare; no prior measure"),
-                  classify(defn, ctx, Status.Passed))
+                  classify(defn, ctx, Status.Failed))
             }
         }
     }
@@ -146,18 +146,18 @@ class SqlCheckExecutor(store: DqStore)(implicit spark: SparkSession) {
               Some(s"Cannot retrieve MOM prior result: ${e.getMessage}"),
               classify(defn, ctx, Status.Errored))
           case Success(None) =>
-            buildResult(dqRefId, defn, source, ctx, Status.Passed,
+            buildResult(dqRefId, defn, source, ctx, Status.Failed,
               Measures.ConsistencyMeasure(current, None, None),
               Some("no prior baseline within retention window"),
-              classify(defn, ctx, Status.Passed))
+              classify(defn, ctx, Status.Failed))
           case Success(Some(prev)) =>
             prev.measures match {
               case Measures.ConsistencyMeasure(pv, _, _) =>
                 if (pv == 0) {
-                  buildResult(dqRefId, defn, source, ctx, Status.Passed,
+                  buildResult(dqRefId, defn, source, ctx, Status.Failed,
                     Measures.ConsistencyMeasure(current, Some(pv), None),
-                    Some("prior MoM value is zero; cannot compute % — passed by default"),
-                    classify(defn, ctx, Status.Passed))
+                    Some("prior MoM value is zero; cannot compute %"),
+                    classify(defn, ctx, Status.Failed))
                 } else {
                   val pctDev = ((current - pv).abs / pv.abs) * 100
                   val passed = pctDev <= defn.deviationTolerance
@@ -168,10 +168,10 @@ class SqlCheckExecutor(store: DqStore)(implicit spark: SparkSession) {
                     classify(defn, ctx, status))
                 }
               case _ =>
-                buildResult(dqRefId, defn, source, ctx, Status.Passed,
+                buildResult(dqRefId, defn, source, ctx, Status.Failed,
                   Measures.ConsistencyMeasure(current, None, None),
                   Some("cannot compare; no prior measure"),
-                  classify(defn, ctx, Status.Passed))
+                  classify(defn, ctx, Status.Failed))
             }
         }
     }

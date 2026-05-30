@@ -63,13 +63,13 @@ class SqlCheckExecutorSpec extends AnyFunSuite with BeforeAndAfterAll {
 
   // ── Consistency delta mode ─────────────────────────────────────────────────
 
-  test("consistency_delta: no prior run -> passed") {
+  test("consistency_delta: no prior baseline -> failed (new issue)") {
     spark.sql("CREATE OR REPLACE TEMP VIEW cons_view AS SELECT 500 AS cnt")
     val r = new SqlCheckExecutor(mkStore).execute(
       defn(EvaluationMode.ConsistencyDelta, "SELECT cnt FROM cons_view"),
       parquetSource("cons_view"), ctx)
-    assert(r.status === Status.Passed)
-    assert(r.issueStatus === None)
+    assert(r.status === Status.Failed)
+    assert(r.issueStatus === Some(IssueStatus.New))
   }
 
   test("consistency_delta: within tolerance -> passed") {
@@ -90,16 +90,16 @@ class SqlCheckExecutorSpec extends AnyFunSuite with BeforeAndAfterAll {
 
   // ── Consistency MOM mode ───────────────────────────────────────────────────
 
-  test("consistency_mom: no 28-31d prior -> passed") {
+  test("consistency_mom: no 28-31d baseline -> failed (new issue)") {
     spark.sql("CREATE OR REPLACE TEMP VIEW mom_view AS SELECT 500 AS cnt")
     val r = new SqlCheckExecutor(mkStore).execute(
       defn(EvaluationMode.ConsistencyMom, "SELECT cnt FROM mom_view"),
       parquetSource("mom_view"), ctx)
-    assert(r.status === Status.Passed)
-    assert(r.issueStatus === None)
+    assert(r.status === Status.Failed)
+    assert(r.issueStatus === Some(IssueStatus.New))
   }
 
-  test("consistency_mom: prior=0 -> passed (percentage undefined)") {
+  test("consistency_mom: prior=0 -> failed (percentage undefined)") {
     spark.sql("CREATE OR REPLACE TEMP VIEW mom_zero AS SELECT 100 AS cnt")
     val store = new com.dqengine.store.DqStore(MariaDbConfig("localhost",3306,"x","x","x")) {
       override def findPreviousResult(a: String, b: String, c: String, d: Option[String], e: Instant, f: Instant) = None
@@ -112,7 +112,7 @@ class SqlCheckExecutorSpec extends AnyFunSuite with BeforeAndAfterAll {
     val r = new SqlCheckExecutor(store).execute(
       defn(EvaluationMode.ConsistencyMom, "SELECT cnt FROM mom_zero"),
       parquetSource("mom_zero"), ctx)
-    assert(r.status === Status.Passed)
+    assert(r.status === Status.Failed)
     assert(r.description.exists(_.contains("zero")))
   }
 

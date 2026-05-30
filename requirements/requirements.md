@@ -10,7 +10,7 @@ Checks are classified by a `check_type` label and evaluated by an `evaluation_mo
 
 Each check is optionally tagged with an `app_code` identifying the application that owns it. The same column can be checked by multiple applications with different business rule filters and different app codes. Runs can be filtered to execute only checks for a specific app code.
 
-Check outcomes are persisted to a MariaDB result store and classified as new, recurring, resolved, or none by comparing against retained history. Results are retained for six months to enable month-on-month consistency comparisons.
+Check outcomes are persisted to a MariaDB result store and classified as new, recurring, or resolved (or untracked when there is no issue) by comparing against retained history. Results are retained for six months to enable month-on-month consistency comparisons.
 
 ## Glossary
 
@@ -18,9 +18,9 @@ Check outcomes are persisted to a MariaDB result store and classified as new, re
 - **check_sql**: The required, user-supplied, read-only SQL statement that the engine executes against the resolved source. For violation-mode checks it returns the rows that violate the rule. For consistency-mode checks it returns a single numeric aggregate.
 - **check_type**: The classification label for the data quality dimension a check addresses. One of: `completeness`, `validity`, `consistency`. Does not select a code path — all checks run through the same executor.
 - **evaluation_mode**: Determines how the check_sql result is judged. One of: `violation`, `consistency_delta`, `consistency_mom`.
-- **violation mode**: check_sql returns the rows that violate the rule. Zero rows = passed; one or more rows = failed.
-- **consistency_delta mode**: check_sql returns a single numeric value. The engine compares it against the most recent prior value for the same check within the six-month retention window. Passed when `|current − prior| ≤ deviation_tolerance`. Errored when no prior value exists in the window (cannot compute deviation).
-- **consistency_mom mode**: check_sql returns a single numeric value. The engine finds the most recent prior result for the same check whose run_timestamp falls between 28 and 31 days before the current run. Passed when `|current − prior_30d| / prior_30d × 100 ≤ deviation_tolerance` (percentage deviation). Errored when no prior value exists in the 28–31-day window or when the prior value is zero (division undefined).
+- **violation mode**: check_sql returns the rows that violate the rule. Zero rows = passed; one or more rows = failed; a SQL/safety/filter error = errored.
+- **consistency_delta mode**: check_sql returns a single numeric value. The engine compares it against the most recent prior value for the same check within the six-month retention window. Passed when `|current − prior| ≤ deviation_tolerance`; failed when the deviation exceeds tolerance; failed when no prior baseline exists in the window or the prior has no usable measure (cannot compare); errored when check_sql returns no value / a non-numeric value, or the prior-result lookup fails.
+- **consistency_mom mode**: check_sql returns a single numeric value. The engine finds the most recent prior result for the same check whose run_timestamp falls between 28 and 31 days before the current run. Passed when `|current − prior_30d| / prior_30d × 100 ≤ deviation_tolerance` (percentage deviation); failed when it exceeds tolerance; failed when no prior baseline exists in the 28–31-day window or the prior value is zero (percentage undefined); errored when check_sql returns no value / a non-numeric value, or the prior-result lookup fails.
 - **app_code**: An optional label on a CheckDefinition identifying the application that owns the check. Enables filtering a run to execute only checks for a specific application. The same table/column combination can have checks from multiple app codes with different business_rule_filters.
 - **business_rule_filter**: An optional WHERE-clause predicate that scopes the rows the check_sql evaluates. Applied to the source before check_sql execution. Rows excluded by the filter are not evaluated.
 - **deviation_tolerance**: For consistency_delta: the absolute numeric deviation that is acceptable. For consistency_mom: the percentage deviation that is acceptable (e.g., 10 means ±10%). Defaults to 0.
@@ -36,7 +36,8 @@ Check outcomes are persisted to a MariaDB result store and classified as new, re
 - **run_id**: Unique identifier for one execution of the engine.
 - **run_timestamp**: Timestamp marking when a run started.
 - **dq_ref_id**: Unique identifier for one persisted DqResult record.
-- **issue_status**: Classification of a result as `new`, `recurring`, or `resolved`.
+- **Status**: The outcome of a check, one of exactly three values: `passed`, `failed`, `errored`. "Did not pass" (the open-exception set) is `{failed, errored}`.
+- **issue_status**: Optional classification of a non-passing result as `new`, `recurring`, or `resolved`. It is absent (NULL) when there is no case to track — i.e., a passing result with no open prior. The non-passing, classified results feed a downstream case-management workflow.
 - **config_version**: Identifier of a specific versioned set of CheckDefinition records.
 - **config_version_date**: Timestamp when a config_version was established.
 
@@ -174,10 +175,11 @@ Check outcomes are persisted to a MariaDB result store and classified as new, re
 4. The engine SHALL compute `deviation = |current_value − prior_value|`.
 5. WHEN `deviation ≤ deviation_tolerance`, the result SHALL be marked passed.
 6. WHEN `deviation > deviation_tolerance`, the result SHALL be marked failed.
-7. WHEN no prior result exists within the Retention_Window, the result SHALL be marked errored with the reason recorded (cannot compute deviation without a baseline).
-8. WHEN the prior result's value is unavailable (store failure), the result SHALL be marked errored.
-9. WHEN the `check_sql` returns no value or a non-numeric value, the result SHALL be marked errored.
-10. The result SHALL carry `current_value`, `prior_value`, and `deviation`.
+7. WHEN no prior baseline exists within the Retention_Window, the result SHALL be marked failed with the reason recorded ("no prior baseline within retention window"). The first run of a consistency check therefore does not pass and is classified as a new issue.
+8. WHEN a prior result exists but has no usable measure to compare against, the result SHALL be marked failed with the reason recorded ("cannot compare; no prior measure").
+9. WHEN the prior-result lookup fails (Result_Store unreachable), the result SHALL be marked errored.
+10. WHEN the `check_sql` returns no value or a non-numeric value, the result SHALL be marked errored.
+11. The result SHALL carry `current_value`, `prior_value`, and `deviation`.
 
 ### 6.2 Month-on-Month Consistency
 
@@ -187,15 +189,17 @@ Check outcomes are persisted to a MariaDB result store and classified as new, re
 4. The engine SHALL compute `pct_deviation = |current_value − prior_30d_value| / |prior_30d_value| × 100` (percentage deviation from the 30-day-prior value).
 5. WHEN `pct_deviation ≤ deviation_tolerance` (where `deviation_tolerance` is interpreted as a percentage, e.g., 10 = ±10%), the result SHALL be marked passed.
 6. WHEN `pct_deviation > deviation_tolerance`, the result SHALL be marked failed.
-7. WHEN no result exists in the 28–31-day window, the result SHALL be marked errored with the reason recorded (no baseline to compare against).
-8. WHEN `prior_30d_value` is zero (division by zero), the engine SHALL mark the result errored with the reason recorded.
-9. WHEN the `check_sql` returns no value or a non-numeric value, the result SHALL be marked errored.
-10. The result SHALL carry `current_value`, `prior_value` (the 30-day-prior value), and `deviation` (the computed percentage deviation).
+7. WHEN no result exists in the 28–31-day window, the result SHALL be marked failed with the reason recorded ("no prior MoM baseline (28–31 day window)"). The first run of a month-on-month check therefore does not pass and is classified as a new issue.
+8. WHEN `prior_30d_value` is zero (percentage undefined), the engine SHALL mark the result failed with the reason recorded ("prior MoM value is zero; cannot compute %").
+9. WHEN the prior-result lookup fails (Result_Store unreachable), the result SHALL be marked errored.
+10. WHEN the `check_sql` returns no value or a non-numeric value, the result SHALL be marked errored.
+11. The result SHALL carry `current_value`, `prior_value` (the 30-day-prior value), and `deviation` (the computed percentage deviation).
 
 ### 6.3 Common Consistency Requirements
 
 1. The `business_rule_filter`, when present, SHALL scope the rows evaluated by `check_sql` before the aggregate is computed.
 2. All consistency lookups SHALL be bounded to the Retention_Window (six months from the current run_timestamp).
+3. A consistency check's first run (no baseline yet) is reported as failed (did not pass) and classified `new`. Once a baseline exists and the value is stable, the check flips to passed and resolved, then carries no issue_status thereafter. Failure can happen across any check type.
 
 ---
 
@@ -215,12 +219,14 @@ Check outcomes are persisted to a MariaDB result store and classified as new, re
 
 **User Story:** As a data quality analyst, I want each result classified as a new, recurring, or resolved issue based on retained history, keyed per application, so that I can distinguish persistent problems from newly introduced ones.
 
-1. Issue classification SHALL use the most recent prior DqResult within the Retention_Window for the same `(table_name, column_name, check_type, app_code)` as the prior-result lookup key.
-2. WHEN the current result is failed or errored AND the prior result (if any) was also failed or errored → `issue_status = recurring`.
-3. WHEN the current result is failed or errored AND (no prior result exists within the window, OR the prior result was passed, OR the prior result lookup fails) → `issue_status = new`.
-4. WHEN the current result is passed AND the prior result was failed or errored → `issue_status = resolved`.
-5. WHEN the current result is passed AND (no prior result exists, OR the prior result was passed, OR the prior result lookup fails) → `issue_status = resolved`.
-6. `issue_status` SHALL be persisted with every DqResult.
+1. Issue classification SHALL use the most recent prior DqResult within the Retention_Window for the same `(table_name, column_name, check_type, app_code)` as the prior-result lookup key. A result is "open" when its status ∈ `{failed, errored}`.
+2. WHEN the current result is open (failed or errored) AND the prior result was also open → `issue_status = recurring`.
+3. WHEN the current result is open (failed or errored) AND (no prior result exists within the window OR the prior result was passed) → `issue_status = new`.
+4. WHEN the current result is passed AND the prior result was open → `issue_status = resolved`.
+5. WHEN the current result is passed AND (no prior result exists OR the prior result was passed) → no `issue_status` is assigned (NULL); there is no case to track.
+6. WHEN the prior-result lookup fails → no `issue_status` is assigned (NULL); the result cannot be classified.
+7. `issue_status` SHALL be persisted with every DqResult when present, and SHALL be NULL/absent when no case is tracked. `issue_status` is one of exactly three values: `new`, `recurring`, `resolved`.
+8. These non-passing, classified results (failed/errored, carrying new/recurring/resolved) are the inputs to a downstream case-management workflow.
 
 ---
 
@@ -230,7 +236,7 @@ Check outcomes are persisted to a MariaDB result store and classified as new, re
 
 1. The engine SHALL write one DqResult per executed check to the Result_Store.
 2. Each DqResult SHALL carry a unique `dq_ref_id` (UUID).
-3. Each DqResult SHALL carry: `check_id`, `app_code`, `config_version`, `config_version_date`, `run_id`, `run_timestamp`, `table_name`, `source_type`, `column_name`, `partition_value`, `check_type`, `evaluation_mode`, `status`, `issue_status`, `violation_count` (violation mode), `current_value` / `prior_value` / `deviation` (consistency modes), `description`.
+3. Each DqResult SHALL carry: `check_id`, `app_code`, `config_version`, `config_version_date`, `run_id`, `run_timestamp`, `table_name`, `source_type`, `column_name`, `partition_value`, `check_type`, `evaluation_mode`, `status`, `issue_status` (nullable — NULL when no case is tracked), `violation_count` (violation mode), `current_value` / `prior_value` / `deviation` (consistency modes), `description`.
 4. IF writing a DqResult fails, the engine SHALL log the error and continue writing remaining results.
 5. The Result_Store SHALL retain every DqResult for at least six months from its `run_timestamp`.
 6. DqResult records older than six months SHALL be eligible for purge. A purge operation SHALL delete only out-of-window records.
@@ -272,7 +278,7 @@ Check outcomes are persisted to a MariaDB result store and classified as new, re
 1. IF the Config_Store or Source_Catalog cannot be read (MariaDB_Store unavailable, auth failure, timeout), the engine SHALL terminate the run before any check executes and return a descriptive error, producing no DQ_Report.
 2. IF a `mariadb_table` or `hive_table` DATA SOURCE cannot be reached, the engine SHALL mark all checks for that source as errored and continue processing other sources and checks.
 3. IF the Result_Store cannot be reached when writing a DqResult, the engine SHALL log the error and continue writing remaining results.
-4. IF the Result_Store cannot be reached when looking up a prior result for a consistency check, the engine SHALL mark that consistency check as errored with the failure reason and continue.
+4. IF the Result_Store cannot be reached when looking up a prior result for a consistency check, the engine SHALL mark that consistency check as errored with the failure reason and continue. (A consistency check with no prior baseline within the window is distinct: it is marked failed, not errored.)
 
 ---
 
@@ -287,7 +293,7 @@ Check outcomes are persisted to a MariaDB result store and classified as new, re
 | **Req 5** — Validity Checks | SqlCheckExecutor (violation mode) | Task 6 |
 | **Req 6** — Consistency Checks | SqlCheckExecutor (consistency_delta · consistency_mom) · DqStore (history lookup) | Task 6 · Task 3 |
 | **Req 7** — Execution Engine | SqlSafetyValidator · SqlCheckExecutor | Task 6 |
-| **Req 8** — Issue Classification | SqlCheckExecutor (classifyIssue) · DqStore | Task 6 · Task 3 |
+| **Req 8** — Issue Classification | IssueClassifier (shared) · SqlCheckExecutor · DqStore | Task 6 · Task 3 |
 | **Req 9** — Result Persistence | DqStore · ResultWriter | Task 3 · Task 7 |
 | **Req 10** — DQ Reporting | ReportGenerator · DqReport | Task 7 |
 | **Req 11** — Run Control | DqEngine · DqEngineMain | Task 8 |
