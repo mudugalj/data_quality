@@ -1,317 +1,231 @@
-# Design Document
+# Design Document — DQ Engine MVP (Parquet · Dask · CSV)
 
-> All `Req N.x` references point to the numbered acceptance criteria in `requirements.md`.
+> All `Req N.x` references point to the numbered acceptance criteria in
+> `requirements.md`.
 
 ## Overview
 
-The DQ Engine is a Scala/Spark application that executes user-supplied SQL checks (`check_sql`) against three source types — Parquet files, MariaDB/MySQL tables, and Hive tables — and evaluates results in three modes: violation (returns bad rows), consistency_delta (compares to last run), and consistency_mom (compares to 30 days prior). Every check carries an optional `app_code` for application-level ownership. There are no hardcoded expected values: all thresholds are expressed in the check_sql itself.
+The DQ Engine MVP is a Python application that executes user-supplied SQL checks
+(`check_sql`) against **partitioned Parquet datasets** using **Dask** and
+**dask-sql**, and writes outcomes to **CSV**. There is no database.
 
-**Key invariants:**
-- All checks are SQL-driven. `check_type` (completeness | validity | consistency) is a classification label only.
-- `evaluation_mode` (violation | consistency_delta | consistency_mom) determines how the SQL result is judged.
-- Config is versioned; every result carries config_version and config_version_date.
+Each Parquet partition is loaded into a Dask DataFrame and registered as a
+dask-sql table named after the logical `table_name`; the user's `check_sql`
+references it directly. Results are judged in two modes — `violation` (returns
+bad rows) and `consistency_mom` (compares an aggregate to ~30 days prior, read
+from the results history CSV). Every result is classified **new / recurring /
+resolved** and the run report carries the **month-end date**.
+
+**Key invariants**
+
+- All checks are SQL-driven; `check_type` is a classification label only.
+- `evaluation_mode` (`violation` | `consistency_mom`) decides how the SQL result
+  is judged.
+- The results CSV is the single source of history for both MoM baselines and
+  issue classification.
 - Issue classification keys on `(table_name, column_name, check_type, app_code)`.
-- All MariaDB_Store access uses parameterized PreparedStatements.
-- MariaDB_Store read failures terminate; data source failures are isolated per-check.
+- Config errors terminate the run; per-check and per-source errors are isolated.
 
 ## Architecture
 
 ```
-CLI (spark-submit)
-  └─ DqEngine
-       ├─ ConfigLoader      — load + validate checks and catalog from DqStore
-       │    └─ ConfigParser  — optional CSV secondary path
-       ├─ SourceResolver    — dispatch by source_type
-       │    ├─ ParquetSourceReader   — partitioned Parquet → Spark temp view
-       │    ├─ MariaDbTableReader    — JDBC to MySQL/MariaDB data source
-       │    └─ HiveTableReader       — JDBC to HiveServer2
-       ├─ SqlCheckExecutor  — single execution path for all checks + classification
-       │    ├─ SqlSafetyValidator    — read-only gate
-       │    └─ IssueClassifier       — shared new/recurring/resolved (or None) classifier
-       └─ DqStore           — all MariaDB_Store I/O (config, catalog, results)
+CLI:  python -m dq_engine --check-types ... --partition ... --app-code ...
+  └─ engine.run(RunConfig)
+       ├─ config_loader     — read + validate dq_checks.csv and source_catalog.csv
+       ├─ history           — load prior results from output/results.csv
+       ├─ source_reader     — resolve + read a Parquet partition into a Dask DataFrame
+       ├─ check_executor    — register table in a dask-sql Context, run check_sql
+       │    ├─ sql_safety        — read-only gate (single SELECT/CTE)
+       │    └─ mom_evaluator     — month-on-month judgement from history
+       ├─ issue_classifier  — new / recurring / resolved from history
+       └─ result_writer     — append results.csv; write exceptions.csv
 ```
+
+Data flow (the requested MVP slice): **read config → process with Dask →
+write results/exceptions to CSV.**
 
 ## Components
 
-### DqStore _(Req 2, 6.1–6.3, 8, 9.1–9.7, 12.1–12.4)_
+### config_loader _(Req 2, 1.1, 3.1)_
 
-All MariaDB_Store I/O via parameterized PreparedStatements. Key methods:
+- `load_checks(path)` → `(list[CheckDefinition], rejects)`. Validates required
+  fields, `check_type ∈ {completeness, validity, consistency}`,
+  `evaluation_mode ∈ {violation, consistency_mom}`, numeric
+  `deviation_tolerance`, and duplicate `check_id`. Per-row isolation: a bad row
+  is rejected with a descriptive message and skipped.
+- `load_catalog(path)` → `(dict[table_name, SourceEntry], rejects)`. Validates
+  `source_type == parquet` and the parquet-specific required fields; drops tables
+  with duplicate entries.
+- A missing required **header** column raises `ConfigError` → run terminates
+  _(Req 12.1)_.
 
-| Method | Satisfies |
-|--------|-----------|
-| `resolveVersion(param)` | Req 2.10, 2.11 |
-| `registerVersion(info)` | Req 2.9 |
-| `loadCheckDefinitions(version)` → raw rows | Req 2.1 |
-| `writeCheckDefinitions(version, defs)` | Req 2.14 |
-| `loadSourceCatalog()` → raw rows | Req 1.4.1–1.4.8 |
-| `writeSourceCatalog(entries)` | Req 1.4 |
-| `writeResult(result)` | Req 9.1–9.3 |
-| `readResultById(dqRefId)` | Req 9 |
-| `findPreviousResult(tableName, columnName, checkType, appCode, beforeTs, windowStart)` | Req 6.1.3, 8.1 |
-| `findMomResult(tableName, columnName, checkType, appCode, windowLow, windowHigh)` | Req 6.2.3 |
-| `purgeOlderThan(cutoff)` | Req 9.5–9.6 |
+### source_reader _(Req 1)_
 
-`MariaDbStoreException` terminates the run _(Req 12.1)_. `ResultStoreUnavailable` is isolated per-result _(Req 9.4, 12.3)_.
+- `list_partitions(entry)` — discover `partition_column=value` directories.
+- `resolve_partition(entry, requested)` — specific value, or
+  lexicographically-greatest for `latest`; `SourceError` when none exist.
+- `read_partition(entry, value)` — `dask.dataframe.read_parquet` on the partition
+  **directory** (a single path string — dask-sql's parquet pushdown rejects a
+  file *list*). The redundant Hive partition column is dropped and any leftover
+  `category` columns are cast to strings, because dask-sql cannot map the
+  `category` dtype.
+- `resolve_and_read(entry, requested)` → `(ddf, partition_value)`.
 
-### ConfigLoader _(Req 2.1–2.14, 12.1)_
+### sql_safety _(Req 7.2–7.3, 5.3.3)_
 
-- `resolveVersion(param)` → `Either[String, ConfigVersionInfo]` — `Left` terminates run _(Req 2.11)_
-- `loadChecks(version)` → validates fields, emits descriptive per-field rejections, continues _(Req 2.2–2.8)_
-- `loadCatalog()` → validates source type and source-type-specific required fields _(Req 1.4)_
-- `initialUpload / reupload / amend` → each assigns fresh `config_version + config_version_date` _(Req 2.9)_
+- `validate_read_only(sql)` — strips comments, rejects multi-statement batches,
+  requires a leading `SELECT`/`WITH`, and rejects a denylist of data-modifying
+  keywords (INSERT/UPDATE/DELETE/MERGE/CREATE/ALTER/DROP/TRUNCATE/…). Returns the
+  cleaned SQL or raises `SqlSafetyError`.
+- `validate_filter(predicate)` — same denylist + no `;`, for `business_rule_filter`.
+- Lightweight by design; a structural parser (e.g. sqlglot) is the documented
+  post-MVP hardening step.
 
-Validation rules:
+### check_executor _(Req 4, 5, 6, 7)_
 
-| Rule | Req |
-|------|-----|
-| Required: check_id, table_name, column_name, check_type, evaluation_mode, check_sql | 2.2, 2.4 |
-| Optional absent/blank → not configured; deviation_tolerance defaults to 0 | 2.3 |
-| check_type ∈ {completeness, validity, consistency} case-sensitive | 2.5 |
-| evaluation_mode ∈ {violation, consistency_delta, consistency_mom} case-sensitive | 2.6 |
-| Duplicate check_id within config_version → all duplicates rejected | 2.7 |
-| Empty Config_Store → empty valid set, no error | 2.8 |
-| Source catalog: table_name + source_type required; source_type ∈ {parquet, mariadb_table, hive_table} | 1.4.1–1.4.5 |
+Single execution path for all checks:
 
-### ConfigParser _(Req 2.13)_
+1. **Safety gate** — `validate_read_only`; rejection → errored.
+2. **Row scoping** — if `business_rule_filter` present, build a scoped table via
+   `SELECT * FROM <table> WHERE <filter>` and register that under `table_name` in
+   a fresh `dask_sql.Context` _(Req 4.4, 5.x.4, 6.11)_.
+3. **Execute** — `ctx.sql(check_sql).compute()`. Any exception → errored
+   _(Req 7.4)_.
+4. **Judge by `evaluation_mode`:**
 
-Parses optional `DQ_CHECKS.csv`: header row excluded; each row must have exactly **14 fields**; same validation rules as ConfigLoader.
+   | Mode | Outcome | Status |
+   |------|---------|--------|
+   | `violation` | 0 rows | passed |
+   | `violation` | ≥1 rows | failed |
+   | `violation` | SQL/safety/filter error | errored |
+   | `consistency_mom` | `pct ≤ tolerance` | passed |
+   | `consistency_mom` | `pct > tolerance` | failed |
+   | `consistency_mom` | no 28–31d baseline | failed |
+   | `consistency_mom` | prior value == 0 | failed |
+   | `consistency_mom` | no value / non-numeric | errored |
 
-### SourceReader (trait) + implementations _(Req 1)_
+### mom_evaluator _(Req 6)_
 
-```scala
-trait SourceReader {
-  def sourceType: SourceType
-  def resolveScope(entry: SourceCatalogEntry, param: PartitionParameter, config: EngineConfig): Either[SourceError, (ReadScope, ScopeLabel)]
-  def read(spark: SparkSession, entry: SourceCatalogEntry, scope: ReadScope, config: EngineConfig): Either[SourceError, ResolvedSource]
-}
-```
+`evaluate_mom(history, key…, current_value, tolerance, run_ts)` →
+`MomOutcome(status, current_value, prior_value, deviation, description)`. Reads
+the most recent `consistency_mom` result in
+`[run_ts − 31d, run_ts − 28d]` from history; computes percentage deviation.
 
-**ParquetSourceReader** _(Req 1.1)_: Hadoop FileSystem partition discovery; registers temp view as `entry.tableName` so check_sql references it directly; records `ScopeLabel.PartitionValue`.
+### history _(Req 6.3, 8.1, 9.5)_
 
-**MariaDbTableReader** _(Req 1.2)_: Reads via direct JDBC connection (not Spark JDBC); full table or filter-column slice; connectivity failures → `Left(SourceError)`.
+`ResultHistory.load(results_csv)` builds an in-memory view over the results CSV.
+Provides:
+- `most_recent_before(key…, before_ts)` — most recent prior result (any status),
+  for classification.
+- `mom_baseline(key…, window_low, window_high)` — most recent `consistency_mom`
+  result in the MoM window.
 
-**HiveTableReader** _(Req 1.3)_: Connects to HiveServer2 via JDBC; check_sql executes directly against Hive. `physical_table_name` is the fully-qualified Hive table name.
+### issue_classifier _(Req 8)_
 
-### SourceResolver _(Req 1.4.7–1.4.8)_
-
-Dispatches by `match` on `source_type`. Errors for missing/duplicate `table_name`, unsupported `source_type` → all checks for that source marked errored, run continues.
-
-### SqlSafetyValidator _(Req 7.2–7.3)_
-
-- Parquet path: Spark `SparkSqlParser` → reject non-query LogicalPlan nodes
-- JDBC path (MariaDB + Hive): structural keyword + semicolon check
-- Rejection → errored result; run continues _(Req 7.4)_
-
-### SqlCheckExecutor _(Req 4, 5, 6, 7, 8)_
-
-Single execution path for all checks. Five steps:
-
-**Step 1 — Safety gate** _(Req 7.2)_: validateReadOnly → errored on rejection.
-
-**Step 2 — Row scoping** _(Req 4.4, 5.1.4, 6.3.1)_: Apply `business_rule_filter` when present:
-- Parquet: overwrite the temp view with `CREATE OR REPLACE TEMP VIEW \`name\` AS SELECT * FROM \`name\` WHERE filter`
-- JDBC (MariaDB/Hive): filter is composed into a WHERE clause wrapping the SQL or embedded in the check_sql
-
-**Step 3 — Execute** on SqlTarget: Spark SQL for Parquet, direct JDBC for MariaDB/Hive.
-
-**Step 4 — Judge by evaluation_mode**:
-
-| Mode | Outcome | Status | Req |
-|------|---------|--------|-----|
-| `violation` | 0 rows | passed | 4.3, 5.1.2, 5.2.2 |
-| `violation` | ≥1 rows | failed | 4.3, 5.1.2, 5.2.2 |
-| `violation` | SQL/safety/filter error | errored | 7.4 |
-| `consistency_delta` | `\|current−prior\| ≤ tolerance` | passed | 6.1.5 |
-| `consistency_delta` | `> tolerance` | failed | 6.1.6 |
-| `consistency_delta` | no prior baseline in window | failed ("no prior baseline within retention window") | 6.1.7 |
-| `consistency_delta` | prior exists, no usable measure | failed ("cannot compare; no prior measure") | 6.1.8 |
-| `consistency_delta` | check_sql no value / non-numeric | errored | 6.1.10 |
-| `consistency_delta` | prior-result lookup fails | errored | 6.1.9, 12.4 |
-| `consistency_mom` | `\|current−prior\|/\|prior\|×100 ≤ tolerance` | passed | 6.2.5 |
-| `consistency_mom` | `> tolerance` | failed | 6.2.6 |
-| `consistency_mom` | no result in 28–31d window | failed ("no prior MoM baseline (28–31 day window)") | 6.2.7 |
-| `consistency_mom` | prior value == 0 | failed ("prior MoM value is zero; cannot compute %") | 6.2.8 |
-| `consistency_mom` | check_sql no value / non-numeric | errored | 6.2.10 |
-| `consistency_mom` | prior-result lookup fails | errored | 6.2.9, 12.4 |
-
-The open / did-not-pass set is `{failed, errored}`. A consistency check's first run has no baseline and is therefore failed (not errored), classified `new`; once a stable baseline exists it flips to passed + resolved, then carries no issue_status. Failure can happen across any check type.
-
-**Step 5 — Issue classification** _(Req 8)_: performed by a shared `IssueClassifier` component (used by both the SqlCheckExecutor and the engine), keyed on `(table_name, column_name, check_type, app_code)`, using the most recent prior result in the Retention_Window. open = status ∈ `{failed, errored}`.
+`classify(history, key…, current_status, run_ts)` → `new | recurring | resolved |
+None`, using the most recent prior result inside the Retention_Window (~183
+days). open = status ∈ `{failed, errored}`.
 
 | Current | Prior | issue_status |
 |---------|-------|--------------|
 | open | open | `recurring` |
-| open | no prior OR passed | `new` |
+| open | no prior / passed | `new` |
 | passed | open | `resolved` |
-| passed | no prior OR passed | None (no case) |
-| any | prior-lookup fails | None (cannot classify) |
+| passed | no prior / passed | None |
 
-These non-passing, classified results feed a downstream case-management workflow.
+### result_writer _(Req 9)_
 
-### IssueClassifier _(Req 8)_
+- `append_results(results_csv, results)` — append a row per result; write the
+  header when the file is new/empty.
+- `write_exceptions(exceptions_csv, results)` — overwrite with the failed/errored
+  subset; returns the count.
 
-Shared component used by both the SqlCheckExecutor and the engine. Given the current status and the most recent prior result within the Retention_Window (keyed on `(table_name, column_name, check_type, app_code)`), it returns `Option[IssueStatus]`: `recurring` (current open + prior open), `new` (current open + no/clean prior), `resolved` (current passed + prior open), or `None` (current passed + no/clean prior, or the prior-lookup failed). open = status ∈ `{failed, errored}`.
+### engine _(Req 10, 11, 12)_
 
-### DqEngine _(Req 11, 12)_
-
-Run lifecycle:
-1. Generate `run_id` + `run_timestamp`
-2. Validate `Selected_Check_Types` _(Req 11.1–11.2)_
-3. Resolve `config_version` — terminate on missing or store failure _(Req 2.10–2.11, 12.1)_
-4. Load + validate checks and catalog — terminate on store failure _(Req 12.1)_
-5. Filter by `Selected_Check_Types` _(Req 11.1)_ and `App_Code_Parameter` _(Req 3.2–3.3)_
-6. Per-check: resolve → read → execute → classify → DqResult; continue on any failure _(Req 7.4)_
-7. Aggregate DqReport _(Req 10)_
-8. Persist results — per-result isolation _(Req 9.4)_
-9. Return `CompletedRun` or `TerminatedRun`
+`run(RunConfig)` lifecycle:
+1. Generate `run_id` + `run_timestamp`; compute `month_end_date`.
+2. Validate `--check-types` _(Req 11.1–11.2)_ → `TerminatedRun` on bad input.
+3. Load + validate config _(Req 2, 12.1)_.
+4. Filter checks by selected types and optional `app_code` _(Req 3, 11)_.
+5. Load history once _(Req 6, 8)_.
+6. Per check: resolve+read partition (cached per table) → execute → classify →
+   build `DqResult`; isolate any failure as errored _(Req 7.4, 12.2–12.3)_.
+7. Append results CSV; write exceptions CSV; return `DqReport` _(Req 9, 10)_.
 
 ## Data Model
 
-### Sealed enums
-
-| Trait | Values |
+### Controlled vocabularies (validated as plain strings)
+| Field | Values |
 |-------|--------|
-| `CheckType` | `completeness`, `validity`, `consistency` |
-| `EvaluationMode` | `violation`, `consistency_delta`, `consistency_mom` |
-| `SourceType` | `parquet`, `mariadb_table`, `hive_table` |
-| `Status` | `passed`, `failed`, `errored` |
-| `IssueStatus` | `new`, `recurring`, `resolved` |
+| `check_type` | `completeness`, `validity`, `consistency` |
+| `evaluation_mode` | `violation`, `consistency_mom` |
+| `source_type` | `parquet` |
+| `status` | `passed`, `failed`, `errored` |
+| `issue_status` | `new`, `recurring`, `resolved` |
 
 ### CheckDefinition
-Fields: `checkId`, `tableName`, `columnName` (required), `dataType` (opt), `checkType` (required), `businessGlossary` (opt), `businessRuleFilter` (opt), `deviationTolerance` (default 0), `checkSql` (required), `evaluationMode` (required), `appCode` (opt). Associated with `configVersion` + `configVersionDate`.
+`check_id, table_name, column_name` (required), `check_type, evaluation_mode,
+check_sql` (required), `data_type, business_glossary, business_rule_filter,
+app_code` (optional), `deviation_tolerance` (default 0).
 
-### DqResult
-Fields: `dqRefId` (UUID), `checkId`, `appCode`, `configVersion`, `configVersionDate`, `runId`, `runTimestamp`, `tableName`, `sourceType`, `columnName`, `partitionValue`, `checkType`, `evaluationMode`, `status`, `measures` (ViolationCount | ConsistencyMeasure | Empty), `description`, `issueStatus: Option[IssueStatus]` (None when no case is tracked).
+### SourceEntry
+`table_name, source_type, parquet_location, partition_column`.
+
+### DqResult (also the results.csv row schema)
+`dq_ref_id, check_id, app_code, run_id, run_timestamp, month_end_date,
+table_name, source_type, column_name, partition_value, check_type,
+evaluation_mode, status, issue_status, violation_count, current_value,
+prior_value, deviation, description`.
 
 ### DqReport
-Fields: `runId`, `runTimestamp`, `configVersion`, `configVersionDate`, `results`, `executed`, `passed`, `failed`, `errored`. `executed = passed + failed + errored`. Helper: `exceptionReport` → failed + errored.
+`run_id, run_timestamp, month_end_date, executed, passed, failed, errored,
+new_issues, recurring_issues, resolved_issues, results, config_rejects`.
+`executed = passed + failed + errored`; `exception_results` = failed + errored.
 
-## Database Schema
+## File Formats
 
-```sql
--- Version registry
-CREATE TABLE config_versions (
-    config_version      VARCHAR(64)  NOT NULL PRIMARY KEY,
-    config_version_date DATETIME(3)  NOT NULL
-);
-CREATE INDEX idx_config_version_date ON config_versions (config_version_date);
-
--- Check definitions (no expected_value, no comparison_operator)
-CREATE TABLE config_store (
-    config_version       VARCHAR(64)   NOT NULL,
-    check_id             VARCHAR(128)  NOT NULL,
-    table_name           VARCHAR(256)  NOT NULL,
-    column_name          VARCHAR(256)  NOT NULL,
-    data_type            VARCHAR(64)   NULL,
-    check_type           VARCHAR(32)   NOT NULL,        -- completeness|validity|consistency
-    business_glossary    TEXT          NULL,
-    business_rule_filter TEXT          NULL,
-    deviation_tolerance  DECIMAL(18,6) NULL,            -- absolute (delta) or percentage (mom)
-    check_sql            TEXT          NOT NULL,
-    evaluation_mode      VARCHAR(32)   NOT NULL,        -- violation|consistency_delta|consistency_mom
-    app_code             VARCHAR(64)   NULL,
-    PRIMARY KEY (config_version, check_id),
-    FOREIGN KEY (config_version) REFERENCES config_versions(config_version),
-    CHECK (check_type IN ('completeness','validity','consistency')),
-    CHECK (evaluation_mode IN ('violation','consistency_delta','consistency_mom'))
-);
-CREATE INDEX idx_config_store_version ON config_store (config_version);
-
--- Source catalog (parquet + mariadb_table + hive_table)
-CREATE TABLE source_catalog (
-    table_name          VARCHAR(256) NOT NULL PRIMARY KEY,
-    source_type         VARCHAR(32)  NOT NULL,          -- parquet|mariadb_table|hive_table
-    parquet_location    TEXT         NULL,
-    partition_column    VARCHAR(256) NULL,
-    connection_ref      VARCHAR(256) NULL,
-    physical_table_name VARCHAR(256) NULL,
-    filter_column       VARCHAR(256) NULL
-);
-
--- Results with full mode-specific measures and app_code
-CREATE TABLE result_store (
-    dq_ref_id           VARCHAR(64)   NOT NULL PRIMARY KEY,
-    check_id            VARCHAR(128)  NOT NULL,
-    app_code            VARCHAR(64)   NULL,
-    config_version      VARCHAR(64)   NOT NULL,
-    config_version_date DATETIME(3)   NOT NULL,
-    run_id              VARCHAR(64)   NOT NULL,
-    run_timestamp       DATETIME(3)   NOT NULL,
-    table_name          VARCHAR(256)  NOT NULL,
-    source_type         VARCHAR(32)   NOT NULL,
-    column_name         VARCHAR(256)  NOT NULL,
-    partition_value     VARCHAR(256)  NULL,
-    check_type          VARCHAR(32)   NOT NULL,
-    evaluation_mode     VARCHAR(32)   NOT NULL,
-    status              VARCHAR(16)   NOT NULL,
-    issue_status        VARCHAR(16)   NULL,
-    violation_count     BIGINT        NULL,             -- violation mode
-    current_value       DECIMAL(38,6) NULL,             -- consistency modes
-    prior_value         DECIMAL(38,6) NULL,             -- consistency modes
-    deviation           DECIMAL(38,6) NULL,             -- consistency modes (abs or pct)
-    description         TEXT          NULL,
-    FOREIGN KEY (config_version) REFERENCES config_versions(config_version),
-    CHECK (status IN ('passed','failed','errored')),
-    CHECK (issue_status IS NULL OR issue_status IN ('new','recurring','resolved')),
-    CHECK (check_type IN ('completeness','validity','consistency')),
-    CHECK (evaluation_mode IN ('violation','consistency_delta','consistency_mom'))
-);
-CREATE INDEX idx_result_tbl_col_type_app_ts ON result_store (table_name, column_name, check_type, app_code, run_timestamp);
-CREATE INDEX idx_result_run_ts ON result_store (run_timestamp);
+### config/dq_checks.csv (header + one row per check)
+```
+check_id,table_name,column_name,data_type,check_type,business_glossary,
+business_rule_filter,deviation_tolerance,check_sql,evaluation_mode,app_code
 ```
 
-## Docker Infrastructure
-
-```yaml
-# MariaDB_Store — engine metadata + results (port 3306)
-mariadb-store:     mysql:8.0   →  dq_store / dq_engine / dq_engine_pw
-
-# Sample MariaDB data source (port 3307)
-mariadb-datasource: mysql:8.0  →  dq_datasource / dq_reader / dq_reader_pw
-
-# Hive — HiveServer2 for hive_table source type (port 10000)
-hive-server:       apache/hive:4.0.1  →  JDBC: jdbc:hive2://localhost:10000/default
+### config/source_catalog.csv
 ```
+table_name,source_type,parquet_location,partition_column
+```
+
+### output/results.csv (appended each run) / output/exceptions.csv (overwritten)
+Columns = the DqResult fields above, in that order.
 
 ## Error Handling
 
 | Failure | Behaviour | Req |
 |---------|-----------|-----|
-| MariaDB_Store unreachable (config/catalog read) | Terminate run, no DQ_Report | 12.1 |
-| Requested config_version not found | Terminate run, no DQ_Report | 2.11 |
-| Invalid Selected_Check_Types | Terminate run, no DQ_Report | 11.2 |
-| Source not found / unreachable | Affected checks errored; continue | 1.1.5, 1.2.5, 1.3.5, 12.2 |
-| check_sql safety validation fails | That check errored; continue | 7.2–7.4 |
-| check_sql execution fails | That check errored; continue | 7.4 |
-| Result_Store write failure | Log; continue writing remaining | 9.4, 12.3 |
-| Prior result lookup fails (consistency) | That check errored; continue | 12.4 |
-| Consistency check has no prior baseline in window | That check failed (not errored); classified `new`; continue | 6.1.7, 6.2.7 |
+| Config CSV missing / bad header | Terminate run, no report | 12.1 |
+| Invalid `--check-types` | Terminate run, no report | 11.2 |
+| Partition missing / unreadable | Affected checks errored; continue | 1.6, 1.7, 12.2 |
+| `check_sql` fails safety or execution | That check errored; continue | 7.2–7.4, 12.3 |
+| MoM baseline missing in 28–31d window | That check **failed** (not errored) | 6.7 |
+| MoM history unreadable | That consistency check errored | 12.4 |
 
 ## Technology Stack
 
 | Concern | Choice |
 |---------|--------|
-| Language | Scala 2.12.18 |
-| Compute | Apache Spark 3.3.2 (Scala 2.12) |
-| Engine DB | MariaDB / MySQL 8.0 in Docker |
-| Data sources | Parquet (Spark), MariaDB (direct JDBC), Hive (HiveServer2 JDBC) |
-| DB drivers | mariadb-java-client 3.1.4 · hive-jdbc 3.1.3 |
-| Build | Maven (scala-maven-plugin, maven-shade-plugin) |
-| Tests | ScalaTest — example-based, no ScalaCheck |
+| Language | Python 3.12 |
+| Compute | Dask 2024.5.1 (dataframe) |
+| SQL engine | dask-sql 2024.5.0 (+ dask-expr 1.1.1) |
+| DataFrames / IO | pandas 2.2.2, pyarrow |
+| Config & results | CSV (stdlib `csv`) |
+| Tests | pytest |
 
-## Requirements Traceability Matrix
+> **Dependency note.** dask-sql 2024.5.0 imports `dask_expr`, a module removed
+> from dask core after 2025. The stack is pinned to a compatible set
+> (`requirements.txt`); newer dask + dask-sql is a post-MVP upgrade.
 
-| Requirement | Design Components | Task |
-|-------------|-------------------|------|
-| Req 1 — Source Types | SourceReader · ParquetSourceReader · MariaDbTableReader · HiveTableReader · SourceResolver | Task 5 |
-| Req 2 — Config Management | DqStore · ConfigLoader · ConfigParser | Task 3 · Task 4 |
-| Req 3 — App Code | CheckDefinition · DqResult · DqEngine | Task 2 · Task 8 |
-| Req 4 — Completeness | SqlCheckExecutor (violation) | Task 6 |
-| Req 5 — Validity | SqlCheckExecutor (violation) | Task 6 |
-| Req 6 — Consistency | SqlCheckExecutor (delta + mom) · DqStore (findPreviousResult · findMomResult) | Task 6 · Task 3 |
-| Req 7 — Execution Engine | SqlSafetyValidator · SqlCheckExecutor | Task 6 |
-| Req 8 — Classification | IssueClassifier (shared) · SqlCheckExecutor · DqStore | Task 6 · Task 3 |
-| Req 9 — Persistence | DqStore · ResultWriter | Task 3 · Task 7 |
-| Req 10 — Reporting | ReportGenerator · DqReport | Task 7 |
-| Req 11 — Run Control | DqEngine · DqEngineMain | Task 8 |
-| Req 12 — Error Handling | DqStore · DqEngine · SourceReaders | Task 3 · Task 5 · Task 8 |
+## Out of Scope (Post-MVP)
+
+MariaDB/Hive source readers, a database result store, a config-versioning store,
+scheduling, and **case management** are not part of the MVP. The CLI is already
+stateless and scheduler-ready (an external cron/Airflow job can invoke it).

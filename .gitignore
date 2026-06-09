@@ -1,39 +1,42 @@
-# ─── Maven / build output ───────────────────────────────────────────────
-target/
-dependency-reduced-pom.xml
-*.class
-
-# ─── Python venv for local Spark 3.3.2 testing (not committed) ───────────
-.spark332-env/
+# ---- Python ----
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+*.egg
 
-# ─── Sample data directory (generated locally; not committed) ────────────
-# Ignore everything under data/ EXCEPT the generator script that the README
-# documents for recreating the sample Parquet partitions.
-data/*
-!data/create_parquet.py
+# ---- Virtual environments ----
+.venv/
+venv/
+env/
+ENV/
 
-# ─── Spark / Hadoop runtime artifacts ───────────────────────────────────
-spark-warehouse/
-metastore_db/
-derby.log
-*.log
+# ---- Test / tooling caches ----
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
 
-# ─── Binary spec / planning docs (kept out of the repo) ─────────────────
-DQ_Engine_Requirements_Design.pptx
-DQ_Engine_Jira_Tasks.xlsx
+# ---- Dask ----
+dask-worker-space/
 
-# ─── Tooling / local agent state ────────────────────────────────────────
-.claude/
-
-# ─── OS / editor noise ──────────────────────────────────────────────────
+# ---- OS / editor ----
 .DS_Store
-*.swp
-*~
 .idea/
 .vscode/
-*.iml
+*.swp
 
-# ─── ScalaTest output ───────────────────────────────────────────────────
-*.scalatest-reports/
+# ---- Generated demo artifacts ----
+# Mock Parquet is reproducible via data/create_parquet.py
+data/**/*.parquet
+# Run outputs are reproducible via the engine + data/seed_history.py
+output/*.csv
+
+# Keep the output/ directory in the repo (tracked, but empty of artifacts)
+!output/.gitkeep

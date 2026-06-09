@@ -1,74 +1,99 @@
-#!/usr/bin/env python3
-"""
-Creates sample Parquet partitions for the DQ Engine demo.
+"""Generate mock partitioned Parquet datasets for the DQ Engine MVP.
 
-Layout:
-  data/parquet/customers/
-    date=2024-01-01/part-00000.parquet   (1000 rows, ~5% null emails)
-    date=2024-01-02/part-00000.parquet   (1050 rows, ~2% null names)
-    date=2024-01-03/part-00000.parquet   (980 rows, clean)
+Creates two Hive-style partitioned tables under data/:
 
-Requires: pip install pyarrow
-Run from the DQ project root: python data/create_parquet.py
+    data/customers/date=2026-05-09/part.parquet   (prior month)
+    data/customers/date=2026-06-09/part.parquet   (current — "latest")
+    data/orders/date=2026-05-09/part.parquet
+    data/orders/date=2026-06-09/part.parquet
+
+The current ("latest") partition is hand-crafted so the sample checks produce a
+mix of passed / failed / errored outcomes. Run with the project venv:
+
+    .venv/bin/python data/create_parquet.py
 """
+
+from __future__ import annotations
 
 import os
-import random
-import string
+import pandas as pd
 
-try:
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-except ImportError:
-    print("ERROR: pyarrow is required. Install with: pip install pyarrow")
-    raise
+HERE = os.path.dirname(os.path.abspath(__file__))
 
-random.seed(42)
+PRIOR = "2026-05-09"
+CURRENT = "2026-06-09"
 
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "parquet", "customers")
 
-COUNTRIES = ["US", "UK", "DE", "FR", "IN", "AU"]
-STATUSES  = ["active", "inactive", "pending"]
+def _write(table: str, partition: str, df: pd.DataFrame) -> None:
+    part_dir = os.path.join(HERE, table, f"date={partition}")
+    os.makedirs(part_dir, exist_ok=True)
+    path = os.path.join(part_dir, "part.parquet")
+    df.to_parquet(path, index=False)
+    print(f"wrote {len(df):>3} rows -> {os.path.relpath(path, HERE)}")
 
-def rand_email(name: str) -> str:
-    domains = ["example.com", "test.org", "demo.net"]
-    return f"{name.lower().replace(' ', '.')}@{random.choice(domains)}"
 
-def rand_name() -> str:
-    first = random.choice(["Alice", "Bob", "Carol", "Dave", "Eve", "Frank", "Grace", "Hank"])
-    last  = random.choice(["Smith", "Jones", "Brown", "Taylor", "Wilson", "Davis"])
-    return f"{first} {last}"
-
-def make_partition(date_str: str, n_rows: int, null_email_pct: float = 0.0, null_name_pct: float = 0.0):
-    customer_ids = list(range(1, n_rows + 1))
-    names        = [rand_name() if random.random() > null_name_pct  else None for _ in range(n_rows)]
-    emails       = [rand_email(n or "unknown") if random.random() > null_email_pct else None for n in names]
-    ages         = [random.randint(18, 80) for _ in range(n_rows)]
-    countries    = [random.choice(COUNTRIES) for _ in range(n_rows)]
-    statuses     = [random.choice(STATUSES) for _ in range(n_rows)]
-
-    table = pa.table({
-        "customer_id": pa.array(customer_ids, type=pa.int32()),
-        "name":        pa.array(names,        type=pa.string()),
-        "email":       pa.array(emails,       type=pa.string()),
-        "age":         pa.array(ages,         type=pa.int32()),
-        "country":     pa.array(countries,    type=pa.string()),
-        "status":      pa.array(statuses,     type=pa.string()),
-        "date":        pa.array([date_str] * n_rows, type=pa.string()),
+def customers_current() -> pd.DataFrame:
+    # Designed outcomes:
+    #   email null      -> id 2          (completeness violation -> FAILED)
+    #   age out of range-> id 4 (age 200)(validity violation     -> FAILED)
+    #   status all valid                 (validity               -> PASSED)
+    #   active rows all have country     (conditional completeness-> PASSED)
+    #   AVG(age) = 64.67                 (MoM vs prior 62.0       -> PASSED, 4.3%)
+    return pd.DataFrame({
+        "id": [1, 2, 3, 4, 5, 6],
+        "name": ["Alice", "Bob", "Carol", "Dave", "Eve", "Frank"],
+        "email": ["alice@x.com", None, "carol@x.com", "dave@x.com",
+                  "eve@x.com", "frank@x.com"],
+        "status": ["active", "active", "inactive", "active", "pending", "active"],
+        "age": [30, 45, 28, 200, 52, 33],
+        "country": ["US", "UK", "US", "CA", "US", "DE"],
     })
 
-    partition_dir = os.path.join(OUTPUT_DIR, f"date={date_str}")
-    os.makedirs(partition_dir, exist_ok=True)
-    out_path = os.path.join(partition_dir, "part-00000.parquet")
-    pq.write_table(table, out_path, compression="snappy")
-    print(f"  Written {n_rows} rows -> {out_path}")
 
-def main():
-    print(f"Creating sample Parquet partitions in: {OUTPUT_DIR}")
-    make_partition("2024-01-01", n_rows=1000, null_email_pct=0.05)
-    make_partition("2024-01-02", n_rows=1050, null_name_pct=0.02)
-    make_partition("2024-01-03", n_rows=980)
-    print("Done. Three partitions created.")
+def customers_prior() -> pd.DataFrame:
+    return pd.DataFrame({
+        "id": [1, 2, 3, 4, 5],
+        "name": ["Alice", "Bob", "Carol", "Dan", "Erin"],
+        "email": ["alice@x.com", "bob@x.com", "carol@x.com", "dan@x.com", "erin@x.com"],
+        "status": ["active", "active", "inactive", "active", "pending"],
+        "age": [29, 44, 27, 60, 51],
+        "country": ["US", "UK", "US", "CA", "US"],
+    })
+
+
+def orders_current() -> pd.DataFrame:
+    # Designed outcomes:
+    #   amount < 0     -> 102            (validity violation -> FAILED)
+    #   customer_id all present          (completeness       -> PASSED)
+    #   status all valid                 (validity           -> PASSED)
+    #   SUM(amount) = 954.5              (MoM vs prior 1200.0 -> FAILED, 20.5%)
+    return pd.DataFrame({
+        "order_id": [101, 102, 103, 104, 105],
+        "customer_id": [1, 2, 3, 1, 5],
+        "amount": [250.00, -15.00, 99.50, 500.00, 120.00],
+        "status": ["placed", "shipped", "delivered", "placed", "cancelled"],
+        "order_date": ["2026-06-01", "2026-06-02", "2026-06-03",
+                       "2026-06-04", "2026-06-05"],
+    })
+
+
+def orders_prior() -> pd.DataFrame:
+    return pd.DataFrame({
+        "order_id": [201, 202, 203, 204],
+        "customer_id": [1, 2, 3, 4],
+        "amount": [300.00, 400.00, 200.00, 300.00],  # sum 1200.0
+        "status": ["placed", "shipped", "delivered", "cancelled"],
+        "order_date": ["2026-05-01", "2026-05-02", "2026-05-03", "2026-05-04"],
+    })
+
+
+def main() -> None:
+    _write("customers", PRIOR, customers_prior())
+    _write("customers", CURRENT, customers_current())
+    _write("orders", PRIOR, orders_prior())
+    _write("orders", CURRENT, orders_current())
+    print("done.")
+
 
 if __name__ == "__main__":
     main()

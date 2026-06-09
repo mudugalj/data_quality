@@ -1,0 +1,9 @@
+# DQ Engine MVP — pinned, mutually-compatible stack.
+# dask-sql 2024.5.0 requires the dask_expr module, which was removed from
+# dask core after 2025; these pins keep the SQL path working.
+dask[dataframe]==2024.5.1
+dask-expr==1.1.1
+dask-sql==2024.5.0
+pandas==2.2.2
+pyarrow
+pytest

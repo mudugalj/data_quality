@@ -1,0 +1,3 @@
+table_name,source_type,parquet_location,partition_column
+customers,parquet,data/customers,date
+orders,parquet,data/orders,date

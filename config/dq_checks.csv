@@ -1,0 +1,11 @@
+check_id,table_name,column_name,data_type,check_type,business_glossary,business_rule_filter,deviation_tolerance,check_sql,evaluation_mode,app_code
+C1_customers_email_not_null,customers,email,string,completeness,Email must be present,,0,SELECT * FROM customers WHERE email IS NULL,violation,CRM
+C2_customers_status_allowed,customers,status,string,validity,Status must be in the allowed domain,,0,"SELECT * FROM customers WHERE status NOT IN ('active','inactive','pending')",violation,CRM
+C3_customers_age_range,customers,age,int,validity,Age within 0..120,,0,SELECT * FROM customers WHERE age < 0 OR age > 120,violation,CRM
+C4_customers_active_country,customers,country,string,completeness,Active customers must have a country,status = 'active',0,SELECT * FROM customers WHERE country IS NULL,violation,CRM
+C5_customers_avg_age_mom,customers,age,int,consistency,Average age should be stable month-on-month,,10,SELECT AVG(age) AS v FROM customers,consistency_mom,CRM
+X1_customers_bad_sql,customers,nonexistent_col,string,validity,Intentionally broken check to demonstrate per-check error isolation,,0,SELECT * FROM customers WHERE nonexistent_col IS NULL,violation,CRM
+O1_orders_customer_id_not_null,orders,customer_id,int,completeness,Every order must reference a customer,,0,SELECT * FROM orders WHERE customer_id IS NULL,violation,ORDER_MGMT
+O2_orders_amount_nonneg,orders,amount,double,validity,Order amount must be non-negative,,0,SELECT * FROM orders WHERE amount < 0,violation,ORDER_MGMT
+O3_orders_sum_amount_mom,orders,amount,double,consistency,Total revenue should be stable month-on-month,,15,SELECT SUM(amount) AS v FROM orders,consistency_mom,ORDER_MGMT
+O4_orders_status_allowed,orders,status,string,validity,Order status must be in the allowed domain,,0,"SELECT * FROM orders WHERE status NOT IN ('placed','shipped','cancelled','delivered')",violation,ORDER_MGMT

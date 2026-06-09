@@ -1,121 +1,147 @@
-# Implementation Plan
+# Implementation Plan — DQ Engine MVP (Parquet · Dask · CSV)
 
-> All `Req N.x` references point to the numbered acceptance criteria in `requirements.md`.
+> All `Req N.x` references point to the numbered acceptance criteria in
+> `requirements.md`. `[x]` = implemented and verified; `[ ]` = not started.
 
 ## Key invariants
-- All checks are SQL-driven. `check_type` is a label only.
-- `evaluation_mode` ∈ {violation, consistency_delta, consistency_mom}. No `metric` mode, no `expected_value`.
+- All checks are SQL-driven; `check_type` is a label only.
+- `evaluation_mode ∈ {violation, consistency_mom}`.
+- Results CSV is the single history source for MoM and classification.
 - Issue classification keys on `(table_name, column_name, check_type, app_code)`.
-- All MariaDB_Store access uses parameterized PreparedStatements.
-- No ScalaCheck or property-based testing.
+- Config errors are fatal; per-check and per-source errors are isolated.
 
 ---
 
-### Task 1 — Project Scaffold and Schema `[ ]`
+### Task 1 — Project Scaffold & Environment `[x]`
 
-**Design refs:** Database Schema, Docker Infrastructure  
-**Requirements:** Req 2.9 (config_versions), Req 1.4 (source_catalog), Req 9 (result_store), Req 1.3 (hive_table source type)
+**Design refs:** Technology Stack
+**Requirements:** —
 
-- `pom.xml`: Scala 2.12.18, Spark 3.3.2 (provided), mariadb-java-client 3.1.4, hive-jdbc 3.1.3 (provided at runtime via Hive JARs), ScalaTest 3.2.17, maven-shade-plugin uber jar
-- `db/schema.sql`: all four tables with updated schema (no expected_value/comparison_operator; add app_code; add evaluation_mode to result_store; new check_type/evaluation_mode values; new index including app_code)
-- `docker-compose.yml`: update to add `hive-server` service (image: apache/hive:4.0.1, port 10000, SERVICE_NAME=hiveserver2); keep existing mariadb-store + mariadb-datasource services
-- `db/hive_datasource_schema.hql`: HiveQL to create sample Hive tables (customers_hive in default database)
-- Package layout: domain, store, config, source, exec, engine under src/main/scala and src/test/scala
-
----
-
-### Task 2 — Domain Model `[ ]`
-
-**Design refs:** Data Model section  
-**Requirements:** Req 2.2–2.3 (CheckDefinition fields), Req 3 (app_code), Req 9.3 (DqResult fields), Req 10 (DqReport)
-
-- Sealed enums: `CheckType` (completeness|validity|consistency), `EvaluationMode` (violation|consistency_delta|consistency_mom), `SourceType` (parquet|mariadb_table|hive_table), `Status` (passed|failed|errored — exactly 3 values), `IssueStatus` (new|recurring|resolved — exactly 3 values) — each with `wire` + case-sensitive `fromWire`
-- Case classes: `ConfigVersionInfo`, `CheckDefinition` (with `appCode: Option[String]`), `SourceCatalogEntry` (with `isPartitionedFileSource`), `PartitionParameter`, `RunContext`, `ReadScope`, `ScopeLabel`, `SqlTarget` (SparkTempView | JdbcConnection), `ResolvedSource`, `Measures` (ViolationCount | ConsistencyMeasure | Empty), `DqResult` (with `appCode`, `evaluationMode`, `issueStatus: Option[IssueStatus]`), `DqReport` (counts executed/passed/failed/errored only — no inconclusive), engine result types, error types, `MariaDbConfig`, `HiveConfig`, `EngineConfig`
-- **Tests:** fromWire round-trips; consistency_delta/consistency_mom are valid EvaluationMode values; Status/IssueStatus each have exactly 3 values; issueStatus is optional (None when no case); exceptionReport = failed + errored; isPartitionedFileSource true only for parquet
+- `requirements.txt` with the pinned compatible stack (dask 2024.5.1, dask-expr
+  1.1.1, dask-sql 2024.5.0, pandas 2.2.2, pyarrow, pytest).
+- `.venv` virtual environment; `.gitignore`.
+- Package layout: `dq_engine/` (engine modules), `config/`, `data/`, `output/`,
+  `tests/`.
+- **Verified:** dask-sql smoke test runs a SELECT filter and an aggregate.
 
 ---
 
-### Task 3 — DqStore: All MariaDB_Store Operations `[ ]`
+### Task 2 — Domain Model `[x]`
 
-**Design refs:** DqStore component, Database Schema  
-**Requirements:** Req 2 (config load/write), Req 6.1.3 (findPreviousResult), Req 6.2.3 (findMomResult), Req 9 (writeResult), Req 12.1–12.4
+**Design refs:** Data Model
+**Requirements:** Req 2.2–2.3, Req 3, Req 9.3, Req 10
 
-- JDBC connection provider; `MariaDbStoreException` + `ResultStoreUnavailable` error types
-- All methods: `resolveVersion`, `registerVersion`, `loadCheckDefinitions`, `writeCheckDefinitions`, `loadSourceCatalog`, `writeSourceCatalog`, `writeResult`, `readResultById`, `findPreviousResult(tableName, columnName, checkType, appCode, beforeTs, windowStart)`, `findMomResult(tableName, columnName, checkType, appCode, momWindowLow, momWindowHigh)`, `purgeOlderThan`
-- `findMomResult` query: `WHERE table_name=? AND column_name=? AND check_type=? AND app_code=? AND run_timestamp BETWEEN ? AND ? ORDER BY run_timestamp DESC LIMIT 1`
-- **Tests (integration, Dockerized MariaDB):** round-trip config_store; round-trip result_store; `findPreviousResult` returns most recent in-window; `findMomResult` returns result in [−31d, −28d] window; `purgeOlderThan` deletes only out-of-window; adversarial values stored verbatim
-
----
-
-### Task 4 — Config Loading, Versioning, and CSV Parser `[ ]`
-
-**Design refs:** ConfigLoader, ConfigParser  
-**Requirements:** Req 2.1–2.14, Req 3.1 (app_code optional), Req 1.4 (source catalog validation)
-
-- `ConfigLoader.resolveVersion`: requested or latest; `Left(VersionNotFound)` terminates run
-- `ConfigLoader.loadChecks`: validates all fields per design rules; check_type ∈ {completeness, validity, consistency}; evaluation_mode ∈ {violation, consistency_delta, consistency_mom}; app_code optional
-- `ConfigLoader.loadCatalog`: validates source_type ∈ {parquet, mariadb_table, hive_table}; source-type-specific required fields
-- Versioning: `initialUpload / reupload / amend` each assign fresh version+date
-- `ConfigParser`: 14-field CSV; header skip; same validation; empty CSV → empty set
-- **Tests:** each rejection path (missing required fields, invalid check_type, invalid evaluation_mode, duplicate check_id); catalog rejections (invalid source_type, parquet/mariadb/hive missing fields); versioning produces distinct dated versions; app_code optional (None when absent); CSV 14-field validation
+- `dq_engine/domain.py`: controlled vocabularies (`CHECK_TYPES`,
+  `EVALUATION_MODES`, `SOURCE_TYPES`, `STATUSES`, `ISSUE_STATUSES`,
+  `OPEN_STATUSES`); dataclasses `CheckDefinition`, `SourceEntry`, `DqResult`
+  (with `month_end_date`, `issue_status`); `RESULT_COLUMNS` (CSV schema).
 
 ---
 
-### Task 5 — Source Reading: Parquet, MariaDB, Hive `[ ]`
+### Task 3 — Config Loading (CSV) `[x]`
 
-**Design refs:** SourceReader, ParquetSourceReader, MariaDbTableReader, HiveTableReader, SourceResolver  
-**Requirements:** Req 1.1–1.4, Req 12.2
+**Design refs:** config_loader
+**Requirements:** Req 2, Req 1.1, Req 3.1, Req 12.1
 
-- `SourceReader` trait: `sourceType`, `resolveScope`, `read` returning `Either[SourceError, ResolvedSource]`
-- `ParquetSourceReader`: Hadoop FileSystem partition discovery; registers Spark temp view as `entry.tableName`; specific or latest partition; errors for missing partition or no partitions _(Req 1.1)_
-- `MariaDbTableReader`: direct java.sql JDBC (not Spark JDBC) to avoid type-inference issues; full table or filter-column slice; connectivity failures → `Left(SourceError)` _(Req 1.2)_
-- `HiveTableReader`: JDBC to HiveServer2 (`jdbc:hive2://host:port/database`); read via direct JDBC connection; `physical_table_name` is `database.table`; filter_column slice supported _(Req 1.3)_
-- `SourceResolver`: dispatch by `match`; missing/duplicate table_name, unsupported source_type → errored, run continues _(Req 1.4.7–1.4.8)_
-- **Tests (Spark-based, local Parquet):** specific + latest partition selection; missing partition → errored; only selected partition rows read; partition_value recorded. Integration tests (MariaDB): full-table + filter slice; connectivity failure → errored. Hive tests: HiveServer2 JDBC connection (if container available); graceful error when HiveServer2 unreachable
+- `load_checks(path)` — validates required fields, `check_type`,
+  `evaluation_mode`, numeric `deviation_tolerance`, duplicate `check_id`;
+  per-row rejection messages; blanks → None; tolerance defaults to 0.
+- `load_catalog(path)` — validates `source_type == parquet`, parquet fields;
+  drops duplicate tables; missing header column → `ConfigError`.
+- **Tests:** `tests/test_config_loader.py` — valid + optional fields; missing
+  required; bad enums (incl. `consistency_delta` rejected); duplicate `check_id`;
+  catalog rejections (unsupported source_type, missing parquet fields).
 
 ---
 
-### Task 6 — Check Execution: All Modes + Classification `[ ]`
+### Task 4 — Parquet Source Reading (Dask) `[x]`
 
-**Design refs:** SqlSafetyValidator, SqlCheckExecutor  
+**Design refs:** source_reader
+**Requirements:** Req 1, Req 12.2
+
+- Partition discovery; specific + `latest` selection; `SourceError` on missing /
+  empty partitions.
+- Reads the partition **directory** (string path) into a Dask DataFrame; drops
+  the redundant Hive partition column; casts `category` columns to strings (both
+  needed for dask-sql compatibility).
+- **Verified:** via the end-to-end engine test and the demo run (`latest`
+  resolves to `date=2026-06-09`).
+
+---
+
+### Task 5 — Check Execution: All Modes + Classification `[x]`
+
+**Design refs:** sql_safety, check_executor, mom_evaluator, history,
+issue_classifier
 **Requirements:** Req 4, 5, 6, 7, 8
 
-- `SqlSafetyValidator`: structural read-only check (Spark parser for Parquet; keyword+structural for JDBC targets); DML/DDL/multi-statement → rejected _(Req 7.2–7.3)_
-- `SqlCheckExecutor` full pipeline:
-  1. Safety gate → errored on rejection _(Req 7.2)_
-  2. business_rule_filter scoping (overwrite temp view for Parquet; compose WHERE clause for JDBC) _(Req 4.4, 5.1.4, 6.3.1)_
-  3. Execute on SqlTarget _(Req 7.1)_
-  4. Judge by evaluation_mode (open / did-not-pass set = {failed, errored}):
-     - **violation**: count rows; 0=passed, >0=failed; SQL/safety/filter error=errored _(Req 4.3, 5.1.2, 5.2.2)_
-     - **consistency_delta**: `|current − prior| ≤ deviation_tolerance` → passed, over → failed; **no prior baseline in window → failed**; prior with no usable measure → failed; check_sql no value/non-numeric → errored; **prior-result lookup fails → errored** _(Req 6.1)_
-     - **consistency_mom**: `|current − prior_30d| / |prior_30d| × 100 ≤ deviation_tolerance` → passed, over → failed; **no 28–31d prior → failed**; prior=0 → failed; check_sql no value/non-numeric → errored; **lookup fails → errored** _(Req 6.2)_
-  5. Issue classification via shared `IssueClassifier`: lookup prior result keyed on `(table_name, column_name, check_type, app_code)` → `new`/`recurring`/`resolved` or `None` (None when current passed + no/clean prior, or prior-lookup fails); open = {failed, errored} _(Req 8)_
-- **Tests:** violation 0 rows → passed; violation N rows → failed; consistency_delta within/over tolerance; consistency_delta no prior baseline → failed; consistency_mom within/over tolerance %; consistency_mom no 28–31d prior → failed; prior=0 → failed (MOM); prior-lookup failure → errored; safety validator accepts SELECT, rejects INSERT/DDL/multi-statement; business_rule_filter scoping; app_code carried to DqResult; IssueClassifier yields new/recurring/resolved and None (no case)
+- `sql_safety` — read-only gate (single SELECT/CTE; denylist; no multi-statement)
+  for `check_sql` and `business_rule_filter`.
+- `check_executor` — safety gate → optional filter scoping → `ctx.sql(...)`
+  → judge by `evaluation_mode`; per-check errors isolated as errored.
+- `mom_evaluator` — 28–31 day baseline lookup; pct deviation vs tolerance;
+  no-baseline / prior-zero → failed; non-numeric → errored.
+- `history` — `ResultHistory` over `results.csv`; `most_recent_before`,
+  `mom_baseline`.
+- `issue_classifier` — new / recurring / resolved / None, keyed on
+  `(table, column, check_type, app_code)`, bounded to the retention window.
+- **Tests:** `tests/test_sql_safety.py`, `tests/test_mom_and_classifier.py`
+  (within/over tolerance, no baseline, prior zero, non-numeric, outside window;
+  recurring/new/resolved/None; errored is open).
 
 ---
 
-### Task 7 — Result Persistence and Reporting `[ ]`
+### Task 6 — Result Persistence & Reporting (CSV) `[x]`
 
-**Design refs:** ResultWriter, ReportGenerator  
-**Requirements:** Req 9, 10
+**Design refs:** result_writer, engine (DqReport)
+**Requirements:** Req 9, Req 10
 
-- `ResultWriter`: write each DqResult via DqStore; per-result isolation; all fields including app_code and evaluation_mode _(Req 9.1–9.4)_
-- `ReportGenerator`: aggregate DqReport; counts executed/passed/failed/errored only; executed = passed + failed + errored; skipped checks excluded; config_version + run metadata stamped through _(Req 10)_
-- **Tests:** one write failure doesn't stop others; count invariants; exceptionReport is failed+errored; app_code carried through; evaluation_mode in each result
+- `result_writer.append_results` (header when new/empty) +
+  `write_exceptions` (overwrite with failed/errored).
+- `DqReport` with status counts, new/recurring/resolved counts, and
+  `month_end_date`; `executed = passed + failed + errored`.
+- **Verified:** demo run writes `output/results.csv` (appended) and
+  `output/exceptions.csv` (5 exception rows) with `month_end_date` populated.
 
 ---
 
-### Task 8 — Engine Orchestration, CLI, and Sample Data `[ ]`
+### Task 7 — Engine Orchestration, CLI & Mock Data `[x]`
 
-**Design refs:** DqEngine, DqEngineMain, Docker Infrastructure  
-**Requirements:** Req 11, 12, Req 2.10–2.12, Req 3.2–3.3
+**Design refs:** engine, __main__
+**Requirements:** Req 10, 11, 12, Req 3.2–3.3
 
-- `DqEngine.run(selectedCheckTypes, partitionParam, configVersionParam, appCodeFilter)`: full lifecycle per design _(Req 11, 12)_
-- `DqEngineMain`: parse 4 CLI args — check_types, partition, config_version (opt), app_code (opt); wire all components; log run summary
-- Sample data:
-  - `data/create_parquet.py`: generate `date=*` partitions for customers Parquet source
-  - `db/datasource_seed.sql`: seed orders + products in MariaDB datasource
-  - `db/dq_checks_seed.sql`: demo checks for all 3 source types, all 3 check_types, all 3 evaluation_modes, multiple app_codes (CRM, ORDER_MGMT, INVENTORY)
-  - `db/hive_datasource_schema.hql`: create Hive sample table and seed data
-- **Tests (mocked stores):** TerminatedRun on missing version; TerminatedRun on store failure; invalid check_types rejected; app_code filter excludes non-matching checks; config_version carried to report; per-check error isolation
-- **End-to-end:** run over Parquet + MariaDB sources; all 3 evaluation_modes; error isolation confirmed; results in result_store with app_code and evaluation_mode
+- `engine.run(RunConfig)` — full lifecycle; per-table partition caching;
+  per-check error isolation; `TerminatedRun` on fatal config / bad check-types.
+- `dq_engine/__main__.py` — CLI (`--check-types`, `--partition`, `--app-code`,
+  `--checks`, `--catalog`, `--results`, `--exceptions`); prints the run report.
+- Mock data: `data/create_parquet.py` (customers + orders, two partitions each),
+  `data/seed_history.py` (prior run ~30 days ago for MoM + recurring/resolved).
+- Sample config: `config/dq_checks.csv` (10 checks across 3 check_types, both
+  evaluation_modes, 2 app codes, plus one intentionally-broken check),
+  `config/source_catalog.csv`.
+- **Tests:** `tests/test_engine_e2e.py` — statuses + classification
+  (failed/recurring, failed/new, MoM passed, errored/new), exceptions file
+  contents, app-code filter excludes all, invalid check-type terminates.
+- **End-to-end demo result:** 10 executed → 5 passed / 4 failed / 1 errored;
+  1 recurring, 1 resolved, 4 new; MoM pass (C5, 4.3%) and MoM fail (O3, 20.46%).
+
+---
+
+## Verification
+
+```bash
+PYTHONPATH=. .venv/bin/python -m pytest -q          # 36 passed
+.venv/bin/python data/create_parquet.py
+PYTHONPATH=. .venv/bin/python data/seed_history.py
+PYTHONPATH=. .venv/bin/python -m dq_engine \
+    --check-types completeness,validity,consistency --partition latest
+```
+
+---
+
+## Out of Scope (Post-MVP) — not implemented
+
+- **Additional source types** — MariaDB/MySQL (JDBC), Hive (HiveServer2).
+- **Database result store** and **config-versioning store** — CSV used instead.
+- **Scheduling** — external cron/Airflow invokes the stateless CLI.
+- **Case management** — removed from scope.
